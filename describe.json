@@ -1,0 +1,160 @@
+{
+  "tools": [
+    {
+      "name": "wechat_send",
+      "description": "Send a WeChat reply to the person whose inbound message arrived most recently. The channel is one-to-one and reply-only: a context token from that message must still be valid. Text longer than 4000 characters is split into consecutive messages, so write the whole reply at once.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Reply text."
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "tags": [
+        "speak"
+      ],
+      "summary": {
+        "zh": "回复最近一条微信消息；只能发给刚发消息的人。",
+        "en": "Reply to the latest WeChat message; sends only to the person who just wrote."
+      }
+    },
+    {
+      "name": "wechat_send_image",
+      "description": "Send a picture to the person whose inbound message arrived most recently. Takes an absolute local file path; the file is uploaded to the WeChat CDN and delivered as a picture. A path whose content is not an image is delivered as a file instead, and the receipt says so. Optional caption is sent as a separate text message first.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute path of a local picture file."
+          },
+          "caption": {
+            "type": "string",
+            "description": "Optional text sent before the picture."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "tags": [
+        "speak"
+      ],
+      "summary": {
+        "zh": "把本地一张图片发到微信。",
+        "en": "Send a local picture to WeChat."
+      }
+    },
+    {
+      "name": "wechat_send_file",
+      "description": "Send a file attachment to the person whose inbound message arrived most recently. Takes an absolute local file path; the file is uploaded to the WeChat CDN and delivered as a downloadable file. Video files are delivered as videos, not as attachments. Optional caption is sent as a separate text message first.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute path of a local file."
+          },
+          "caption": {
+            "type": "string",
+            "description": "Optional text sent before the file."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "tags": [
+        "speak"
+      ],
+      "summary": {
+        "zh": "把本地一个文件发到微信。",
+        "en": "Send a local file to WeChat."
+      }
+    },
+    {
+      "name": "wechat_status",
+      "description": "Report the WeChat ClawBot connection: bound account, whether the long poll is connected, the last inbound message time, the last error and how many context tokens are held.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "tags": [
+        "read",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "查看微信连接、账号、最近消息与错误。",
+        "en": "Show the WeChat connection, account, last message and errors."
+      }
+    },
+    {
+      "name": "wechat_events",
+      "description": "Read archived WeChat events by kind and time. kind accepts * as a wildcard. Raw payloads never include context tokens.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Event kind or glob, for example message/private."
+          },
+          "since": {
+            "type": "string",
+            "description": "ISO 8601 lower bound, inclusive."
+          },
+          "until": {
+            "type": "string",
+            "description": "ISO 8601 upper bound, inclusive."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum events to return, 1-100, default 30."
+          }
+        }
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "按类型和时间查已归档的微信事件。",
+        "en": "Read archived WeChat events by kind and time."
+      }
+    }
+  ],
+  "events": [
+    {
+      "type": "wechat-claw.message",
+      "description": {
+        "zh": "一条微信私聊消息；正文是一行可读文本，媒体路径写在正文里，图片与语音作为附件随事件到达。",
+        "en": "A WeChat 1:1 message; the text is one readable line, media paths are inline, and pictures or voices arrive as attachments."
+      },
+      "trigger": "debounce"
+    },
+    {
+      "type": "wechat-claw.link",
+      "description": {
+        "zh": "绑定状态变化：绑定成功或会话过期。",
+        "en": "The binding changed: bound, or the session expired."
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "key": "worlds.wechat-claw.envPrompt",
+      "title": "微信 ClawBot · 环境提示词",
+      "role": "envPrompt",
+      "content": "微信 ClawBot 是一条一对一私聊通道，接在微信里，只能回复刚发消息的那个人。\n\n## 手边的状态\n\n{{wechat.state | (微信还没接上。)}}\n{{wechat.account | (还没有绑定的微信号。)}}\n{{wechat.lastMessageAt | (还没有收到过微信消息。)}}\n{{wechat.lastError | (最近没有连接错误。)}}\n\n## 什么时候用\n\n微信里来人说话时，会收到一条 `wechat-claw.message`，正文以 `[微信 时间 发送者]` 开头，媒体路径就写在里面。要回话就用 `wechat_send`；图片用 `wechat_send_image`，其他文件用 `wechat_send_file`，两者都接本机绝对路径。\n\n- 对方发来图片时，图片会作为附件一起到达，路径也写在正文里。看不到附件时，按路径自行读取。\n- 对方发来文件时，路径写在正文里，需要内容就按路径读。\n- 对方发来视频时，视频落盘、路径写在正文里；抽帧可用时按时间顺序附几张画面，正文会写明抽了几帧。正文说「视频帧未抽取」就是真的没看过，不要描述画面内容。\n- 对方发来语音时，正文里带服务端的转写文本；语音本身是 SILK 编码，一般不必再处理。没有转写文本时，你只知道时长，不知道说了什么。\n\n## 约束\n\n这条通道只能回复最近发消息的人，不能主动找人，也不能发到别处。`wechat_send` 的回执会写明发给了谁。\n\n一条文本最多 4000 字，超出的部分会自动接着发成下一条，不必自己切。断行位置优先落在段落和句号上。\n\n对方的 `context_token` 会过期。回复被拒并提示没有可用 token 时，等对方再说一句再回，不要反复重试。\n\n这里发出的一切都会真的进到对方的微信里。不确定要不要发的时候，先问清楚。\n"
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "name": "cortico-world-wechat-claw",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "在微信里和桌宠一对一聊天：文字、图片、文件双向收发，语音用微信的转写文本，视频可按需抽帧给模型看。",
+  "author": {
+    "name": "云纪"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Unnori/cortico-world-wechat-claw.git"
+  },
+  "homepage": "https://github.com/Unnori/cortico-world-wechat-claw#readme",
+  "bugs": {
+    "url": "https://github.com/Unnori/cortico-world-wechat-claw/issues"
+  },
+  "keywords": [
+    "cortico-world",
+    "cortico",
+    "coopanion",
+    "wechat",
+    "weixin",
+    "clawbot",
+    "ilink",
+    "image",
+    "file"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.28.6",
+  "main": "./src/index.ts",
+  "cortico": {
+    "kind": "world",
+    "api": 6,
+    "displayName": "微信 ClawBot",
+    "icon": "assets/icon.png",
+    "describe": "describe.json",
+    "webUiClient": "dist/webui.js",
+    "tags": [
+      "im",
+      "unofficial-api"
+    ],
+    "locales": {
+      "zh": {
+        "displayName": "微信 ClawBot",
+        "description": "在微信里和桌宠一对一聊天：文字、图片、文件双向收发，语音用微信的转写文本，视频可按需抽帧给模型看。"
+      },
+      "en": {
+        "displayName": "WeChat ClawBot",
+        "description": "Chat with the pet one-to-one in WeChat: text, images and files both ways, voice through WeChat's transcript, and optional video frames for the model."
+      }
+    }
+  },
+  "files": [
+    "src",
+    "dist",
+    "assets",
+    "describe.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "node scripts/build-webui.mjs"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "undici": "^8.12.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "cortico": "^0.2.7",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
