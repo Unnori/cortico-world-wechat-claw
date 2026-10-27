@@ -169,6 +169,9 @@ var TEXT2 = {
     refresh: "\u91CD\u65B0\u751F\u6210",
     cancel: "\u53D6\u6D88\u626B\u7801",
     reconnect: "\u91CD\u65B0\u8FDE\u63A5",
+    unbind: "\u89E3\u7ED1",
+    unbindConfirm: "\u89E3\u7ED1\u4F1A\u6E05\u6389\u672C\u673A\u4FDD\u5B58\u7684\u5FAE\u4FE1\u51ED\u636E\uFF0C\u4E4B\u540E\u8981\u91CD\u65B0\u626B\u7801\u624D\u80FD\u6536\u6D88\u606F\u3002\u5FAE\u4FE1\u91CC\u7684\u90A3\u4E2A\u5BF9\u8BDD\u4E0D\u4F1A\u6D88\u5931\u3002\u786E\u5B9A\u89E3\u7ED1\uFF1F",
+    unbindDone: "\u5DF2\u89E3\u7ED1\uFF0C\u672C\u673A\u4E0D\u518D\u6536\u53D1\u5FAE\u4FE1\u6D88\u606F\u3002",
     verifyLabel: "\u624B\u673A\u5FAE\u4FE1\u663E\u793A\u7684\u6570\u5B57",
     verifyPlaceholder: "\u4F8B\u5982 123456",
     verifySubmit: "\u63D0\u4EA4\u9A8C\u8BC1\u7801",
@@ -192,6 +195,9 @@ var TEXT2 = {
     refresh: "New QR code",
     cancel: "Cancel",
     reconnect: "Reconnect",
+    unbind: "Unbind",
+    unbindConfirm: "Unbinding clears the WeChat credentials saved on this machine; you will need to scan again to receive messages. The chat in WeChat itself stays. Continue?",
+    unbindDone: "Unbound. This machine no longer sends or receives WeChat messages.",
     verifyLabel: "The number shown in WeChat",
     verifyPlaceholder: "for example 123456",
     verifySubmit: "Submit",
@@ -241,9 +247,11 @@ async function mountBinding(ctx) {
   const generateButton = ui.button(t.generate, { variant: "primary" });
   const cancelButton = ui.button(t.cancel, { size: "sm" });
   const reconnectButton = ui.button(t.reconnect, { size: "sm" });
+  const unbindButton = ui.button(t.unbind, { variant: "danger", size: "sm" });
   cancelButton.style.display = "none";
   reconnectButton.style.display = "none";
-  actions.append(generateButton, cancelButton, reconnectButton);
+  unbindButton.style.display = "none";
+  actions.append(generateButton, cancelButton, reconnectButton, unbindButton);
   sheet.body.append(stateLine, whoLine, tokenLine, messageLine, qrBox, linkRow, verifyRow, actions);
   let currentState = {
     bound: false,
@@ -252,6 +260,7 @@ async function mountBinding(ctx) {
     accountId: "",
     userId: "",
     lastMessageAt: "",
+    lastMessageLocal: "",
     lastError: "",
     contextTokens: 0,
     qrDataUrl: "",
@@ -269,7 +278,8 @@ async function mountBinding(ctx) {
     whoLine.style.display = next.bound ? "" : "none";
     tokenLine.textContent = next.bound ? t.tokenCount(next.contextTokens) : "";
     tokenLine.style.display = next.bound ? "" : "none";
-    messageLine.textContent = next.lastMessageAt ? t.lastMessage(next.lastMessageAt.replace("T", " ").slice(0, 19)) : next.bound ? t.noMessage : "";
+    const stamp = next.lastMessageLocal || (next.lastMessageAt ? next.lastMessageAt.replace("T", " ").slice(0, 19) : "");
+    messageLine.textContent = stamp ? t.lastMessage(stamp) : next.bound ? t.noMessage : "";
     messageLine.style.display = next.bound ? "" : "none";
     if (next.loginError) {
       stateLine.textContent = next.loginError;
@@ -289,6 +299,7 @@ async function mountBinding(ctx) {
     generateButton.style.display = next.bound ? "none" : "";
     cancelButton.style.display = binding && !next.bound ? "" : "none";
     reconnectButton.style.display = next.bound ? "" : "none";
+    unbindButton.style.display = next.bound ? "" : "none";
   };
   const readState = async () => {
     try {
@@ -325,6 +336,21 @@ async function mountBinding(ctx) {
         paint(await ctx.invoke("reconnect"));
       } catch (err) {
         ui.toast(err instanceof Error ? err.message : String(err), "bad");
+      }
+    })();
+  });
+  unbindButton.addEventListener("click", () => {
+    void (async () => {
+      const ok = await ui.confirm({ title: t.unbind, body: t.unbindConfirm, danger: true });
+      if (!ok) return;
+      unbindButton.disabled = true;
+      try {
+        paint(await ctx.invoke("unbind"));
+        ui.toast(t.unbindDone, "ok");
+      } catch (err) {
+        ui.toast(err instanceof Error ? err.message : String(err), "bad");
+      } finally {
+        unbindButton.disabled = false;
       }
     })();
   });

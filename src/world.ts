@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 微信 ClawBot World。
  *
  * 一个 iLink 一对一通道：扫码绑定、长轮询收消息、按类型回复文字/图片/文件。
@@ -428,6 +428,13 @@ export class WechatClawWorld implements World {
       accountId: auth?.accountId ?? '',
       userId: auth?.userId ?? '',
       lastMessageAt: this.#lastMessageAt,
+      /**
+       * 面板显示用的本地时间。`lastMessageAt` 是 UTC ISO，直接截字符串会让操作者
+       * 看到 UTC 钟点（比如北京时间 05:11 显示成 21:11），所以这里按部署时区格式化。
+       */
+      lastMessageLocal: this.#lastMessageAt
+        ? `${this.#localStamp(Date.parse(this.#lastMessageAt))}`
+        : '',
       lastError: login?.error || this.#lastError,
       contextTokens: this.#contextCount,
       startedAt: this.#startedAt,
@@ -460,6 +467,7 @@ export class WechatClawWorld implements World {
         case 'verify': return this.#submitVerify(args?.[0]);
         case 'cancel': return this.#cancelBinding();
         case 'reconnect': return this.#reconnect();
+        case 'unbind': return this.#unbind();
         default: throw new Error(`未知方法：${panel}.${method}`);
       }
     }
@@ -566,6 +574,59 @@ export class WechatClawWorld implements World {
     this.#lastError = '';
     await this.#restartDriver();
     this.#host?.log?.info?.('微信手动重连');
+    return this.#publicState();
+  }
+
+  /**
+   * 解绑：清掉本机保存的凭据与游标，停掉长轮询，回到未绑定状态。
+   *
+   * 只清本机。微信侧的绑定关系在手机微信里，这里碰不到，所以面板文案要说清楚：
+   * 解绑后本机不再收消息，但微信里的那个 ClawBot 对话还在。
+   */
+  async #unbind(): Promise<unknown> {
+    const hadToken = Boolean(this.#auth?.token);
+
+    // 停掉轮询，避免解绑后还有请求带着旧令牌出去。
+    const driver = this.#driver;
+    this.#driver = null;
+    if (driver) {
+      try {
+        await driver.stop();
+      } catch {
+        /* 停不下来也继续清凭据。 */
+      }
+    }
+
+    // 绑定流程也一并取消。
+    if (this.#login?.active) {
+      this.#login.active = false;
+      this.#loginAbort?.abort();
+    }
+    this.#login = null;
+    this.#loginAbort = null;
+
+    this.#auth = null;
+    this.#contextCount = 0;
+    this.#lastUserId = '';
+    this.#lastMessageAt = '';
+    this.#typingTickets.clear();
+    this.#lastError = '';
+
+    await this.#store.clearSession().catch((err) => {
+      this.#host?.log?.warn?.('清凭据失败', { error: errorText(err) });
+    });
+
+    this.#host?.log?.info?.(hadToken ? '微信已解绑' : '微信本来就没绑定，已清空本地状态');
+
+    await this.#pushEvent({
+      type: EVENT_LINK,
+      ts: nowIso(this.#timezone),
+      source: ID,
+      origin: 'internal',
+      text: hadToken ? '微信已解绑，本机不再收发消息。' : '微信本地状态已清空（原本未绑定）。',
+      meta: { kind: 'link/unbound' },
+    });
+
     return this.#publicState();
   }
 
@@ -759,7 +820,7 @@ export class WechatClawWorld implements World {
       this.#login.verifyCode = '';
     }
     await this.#rebuildClient();
-    this.#startDriver();
+    await this.#startDriver();
     this.#host?.log?.info?.('微信绑定成功', { accountId, userId: shortId(userId) });
     await this.#pushEvent({
       type: EVENT_LINK,
@@ -821,7 +882,7 @@ export class WechatClawWorld implements World {
         { label: t.badgeAccount, value: state.bound ? (who || '—') : '—', tone: state.bound ? 'on' : 'off' },
         {
           label: t.badgeLast,
-          value: state.lastMessageAt ? state.lastMessageAt.slice(11, 19) : '—',
+          value: state.lastMessageLocal ? state.lastMessageLocal.slice(11, 19) : '—',
           tone: state.lastMessageAt ? 'on' : 'off',
         },
         { label: t.badgeState, value: stateText, tone: state.connected ? 'on' : 'off' },
@@ -876,7 +937,7 @@ export class WechatClawWorld implements World {
 
     this.#started = true;
     if (this.#auth?.token) {
-      this.#startDriver();
+      await this.#startDriver();
     } else {
       host.log.info('微信尚未绑定，等待扫码');
     }
@@ -900,6 +961,25 @@ export class WechatClawWorld implements World {
       log?.info?.(`视频抽帧可用（${this.#ffmpeg.detail}）`);
     } else {
       log?.info?.(`视频抽帧不可用：${this.#ffmpeg.detail}`);
+    }
+  }
+
+  /** 把毫秒时间按部署时区格式化成 `YYYY-MM-DD HH:MM:SS`，给面板与回执看。 */
+  #localStamp(ms: number): string {
+    const d = new Date(Number.isFinite(ms) ? ms : Date.now());
+    try {
+      const parts = new Intl.DateTimeFormat('sv-SE', {
+        timeZone: this.#timezone || undefined,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false,
+      }).format(d);
+      return parts.replace(' ', ' ');
+    } catch {
+      // 时区名无效时退回本机时区，总比显示 UTC 强。
+      const pad = (n: number) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+        + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     }
   }
 
@@ -945,13 +1025,27 @@ export class WechatClawWorld implements World {
     });
   }
 
-  #startDriver(): void {
+  /**
+   * 启动长轮询。
+   *
+   * 旧驱动必须先**真正停下**再起新的：两个驱动会各带自己的游标去问，服务端把消息推给其中
+   * 一个、另一个把它写回旧游标，于是两边都以为「没新消息」。连续点几次重连正好触发这个。
+   * 所以这里先置空（让旧驱动的回调立刻失效），再 await 它退出。
+   */
+  async #startDriver(): Promise<void> {
     const api = this.#api;
     const auth = this.#auth;
     if (!api || !auth?.token) return;
+
     const previous = this.#driver;
     this.#driver = null;
-    if (previous) void previous.stop();
+    if (previous) {
+      try {
+        await previous.stop();
+      } catch (err) {
+        this.#host?.log?.warn?.('旧驱动停止失败', { error: errorText(err) });
+      }
+    }
 
     // 回调要认「这条消息是不是当前驱动发来的」，所以先声明再赋值。
     let driver: ILinkDriver;
@@ -961,6 +1055,7 @@ export class WechatClawWorld implements World {
       log: this.#host?.log ?? nullLoggerShim(),
       onMessage: (message): Promise<void> => this.#handleInbound(driver, message),
       onStatus: (status): void => this.#handleStatus(driver, status),
+      onStalled: (): void => this.#handleStalled(driver),
     });
     this.#driver = driver;
     driver.start();
@@ -970,9 +1065,24 @@ export class WechatClawWorld implements World {
     });
   }
 
+  /** 重连多次都没响应：重建客户端（新连接）再起驱动，并如实记一条。 */
+  #handleStalled(driver: ILinkDriver): void {
+    if (driver !== this.#driver) return;
+    this.#host?.log?.warn?.('微信长轮询长时间没有响应，重建连接');
+    this.#lastError = '长轮询长时间没有响应，已重建连接';
+    void (async () => {
+      try {
+        await this.#rebuildClient();
+        await this.#startDriver();
+      } catch (err) {
+        this.#host?.log?.warn?.('重建连接失败', { error: errorText(err) });
+      }
+    })();
+  }
+
   async #restartDriver(): Promise<void> {
     await this.#rebuildClient();
-    this.#startDriver();
+    await this.#startDriver();
   }
 
   #handleStatus(driver: ILinkDriver, status: { connected: boolean; expired: boolean; error: string }): void {

@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-wechat-claw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "在微信里和桌宠一对一聊天：文字、图片、文件双向收发，语音用微信的转写文本，视频可按需抽帧给模型看。",
   "author": {

@@ -19,6 +19,8 @@ interface BindingState {
   accountId: string;
   userId: string;
   lastMessageAt: string;
+  /** 已按部署时区格式化好的本地时间；优先用它，别直接截 lastMessageAt。 */
+  lastMessageLocal: string;
   lastError: string;
   contextTokens: number;
   qrDataUrl: string;
@@ -36,6 +38,9 @@ const TEXT = {
     refresh: '重新生成',
     cancel: '取消扫码',
     reconnect: '重新连接',
+    unbind: '解绑',
+    unbindConfirm: '解绑会清掉本机保存的微信凭据，之后要重新扫码才能收消息。微信里的那个对话不会消失。确定解绑？',
+    unbindDone: '已解绑，本机不再收发微信消息。',
     verifyLabel: '手机微信显示的数字',
     verifyPlaceholder: '例如 123456',
     verifySubmit: '提交验证码',
@@ -59,6 +64,9 @@ const TEXT = {
     refresh: 'New QR code',
     cancel: 'Cancel',
     reconnect: 'Reconnect',
+    unbind: 'Unbind',
+    unbindConfirm: 'Unbinding clears the WeChat credentials saved on this machine; you will need to scan again to receive messages. The chat in WeChat itself stays. Continue?',
+    unbindDone: 'Unbound. This machine no longer sends or receives WeChat messages.',
     verifyLabel: 'The number shown in WeChat',
     verifyPlaceholder: 'for example 123456',
     verifySubmit: 'Submit',
@@ -120,9 +128,11 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
   const generateButton = ui.button(t.generate, { variant: 'primary' });
   const cancelButton = ui.button(t.cancel, { size: 'sm' });
   const reconnectButton = ui.button(t.reconnect, { size: 'sm' });
+  const unbindButton = ui.button(t.unbind, { variant: 'danger', size: 'sm' });
   cancelButton.style.display = 'none';
   reconnectButton.style.display = 'none';
-  actions.append(generateButton, cancelButton, reconnectButton);
+  unbindButton.style.display = 'none';
+  actions.append(generateButton, cancelButton, reconnectButton, unbindButton);
 
   sheet.body.append(stateLine, whoLine, tokenLine, messageLine, qrBox, linkRow, verifyRow, actions);
 
@@ -133,6 +143,7 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
     accountId: '',
     userId: '',
     lastMessageAt: '',
+    lastMessageLocal: '',
     lastError: '',
     contextTokens: 0,
     qrDataUrl: '',
@@ -166,9 +177,9 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
     tokenLine.textContent = next.bound ? t.tokenCount(next.contextTokens) : '';
     tokenLine.style.display = next.bound ? '' : 'none';
 
-    messageLine.textContent = next.lastMessageAt
-      ? t.lastMessage(next.lastMessageAt.replace('T', ' ').slice(0, 19))
-      : (next.bound ? t.noMessage : '');
+    // 用服务端给的本地时间；没有就退回原始值，但不截 UTC 钟点。
+    const stamp = next.lastMessageLocal || (next.lastMessageAt ? next.lastMessageAt.replace('T', ' ').slice(0, 19) : '');
+    messageLine.textContent = stamp ? t.lastMessage(stamp) : (next.bound ? t.noMessage : '');
     messageLine.style.display = next.bound ? '' : 'none';
 
     // 错误：优先显示扫码期的具体原因。
@@ -189,12 +200,13 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
 
     verifyRow.style.display = next.verifyRequired ? '' : 'none';
 
-    // 按钮：未绑定给「生成二维码」，扫码中给「取消」；已绑定给「重新连接」。
+    // 按钮：未绑定给「生成二维码」，扫码中给「取消」；已绑定给「重新连接」与「解绑」。
     const binding = next.status === 'binding' || Boolean(next.qrDataUrl);
     generateButton.textContent = binding ? t.refresh : t.generate;
     generateButton.style.display = next.bound ? 'none' : '';
     cancelButton.style.display = binding && !next.bound ? '' : 'none';
     reconnectButton.style.display = next.bound ? '' : 'none';
+    unbindButton.style.display = next.bound ? '' : 'none';
   };
 
   const readState = async (): Promise<void> => {
@@ -235,6 +247,23 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
         paint(await ctx.invoke<BindingState>('reconnect'));
       } catch (err) {
         ui.toast(err instanceof Error ? err.message : String(err), 'bad');
+      }
+    })();
+  });
+
+  // 解绑会清凭据，先确认一次；不可撤销，所以给 danger 样式的确认框。
+  unbindButton.addEventListener('click', () => {
+    void (async () => {
+      const ok = await ui.confirm({ title: t.unbind, body: t.unbindConfirm, danger: true });
+      if (!ok) return;
+      unbindButton.disabled = true;
+      try {
+        paint(await ctx.invoke<BindingState>('unbind'));
+        ui.toast(t.unbindDone, 'ok');
+      } catch (err) {
+        ui.toast(err instanceof Error ? err.message : String(err), 'bad');
+      } finally {
+        unbindButton.disabled = false;
       }
     })();
   });

@@ -369,6 +369,97 @@ describe('入站消息', () => {
     expect(result.cancelled).toBe(false);
     await world.stop();
   });
+  it('解绑会清掉凭据与游标，回到未绑定状态', async () => {
+    const srv = await startFakeServer();
+    server = srv;
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    const authDir = join(scratchDir, 'wechat-claw');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(join(authDir, 'auth.json'), JSON.stringify({
+      token: 'bot-token-123', baseUrl: srv.baseUrl, accountId: 'bot-account@im.bot',
+      userId: 'wx-user@im.wechat', savedAt: new Date().toISOString(),
+    }));
+    writeFileSync(join(authDir, 'context-tokens.json'), JSON.stringify({ 'wx-user@im.wechat': 'ctx-1' }));
+    writeFileSync(join(authDir, 'sync.json'), JSON.stringify({ get_updates_buf: 'buf-x' }));
+
+    const host = new FakeHost();
+    await world.start(host);
+    await waitFor(() => world.envPromptVars()['wechat.state'] === '已连接', 5000);
+
+    const invoke = world.webUi('zh').invoke!;
+    const before = await invoke('binding', 'state', []) as Record<string, unknown>;
+    expect(before.bound).toBe(true);
+
+    const after = await invoke('binding', 'unbind', []) as Record<string, unknown>;
+    expect(after.bound).toBe(false);
+    expect(after.connected).toBe(false);
+    expect(after.contextTokens).toBe(0);
+    expect(after.lastMessageAt).toBe('');
+
+    // 凭据文件真的没了。
+    expect(existsSync(join(authDir, 'auth.json'))).toBe(false);
+    expect(existsSync(join(authDir, 'context-tokens.json'))).toBe(false);
+    expect(existsSync(join(authDir, 'sync.json'))).toBe(false);
+
+    // 解绑后发消息会被拒（不再有凭据）。
+    const send = world.tools().find((tool) => tool.name === 'wechat_send')!;
+    await expect(send.handler({ text: 'hi' }, call)).rejects.toThrow(/未连接|扫码/);
+    await world.stop();
+  });
+
+  it('解绑后还能重新扫码绑定', async () => {
+    const srv = await startFakeServer();
+    server = srv;
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    const host = new FakeHost();
+    await world.start(host);
+    const invoke = world.webUi('zh').invoke!;
+
+    // 未绑定状态下解绑不该报错。
+    const cleared = await invoke('binding', 'unbind', []) as Record<string, unknown>;
+    expect(cleared.bound).toBe(false);
+
+    // 之后仍能发起扫码。
+    const started = await invoke('binding', 'start', []) as Record<string, unknown>;
+    expect(started.status).toBeTruthy();
+    await waitFor(() => Boolean((world.envPromptVars()['wechat.state'])), 3000);
+    await invoke('binding', 'cancel', []);
+    await world.stop();
+  });
+
+  it('面板给的是本地时间，不是 UTC 钟点', async () => {
+    const srv = await startFakeServer();
+    server = srv;
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    const authDir = join(scratchDir, 'wechat-claw');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(join(authDir, 'auth.json'), JSON.stringify({
+      token: 'bot-token-123', baseUrl: srv.baseUrl, accountId: 'bot-account@im.bot',
+      userId: 'wx-user@im.wechat', savedAt: new Date().toISOString(),
+    }));
+    writeFileSync(join(authDir, 'context-tokens.json'), JSON.stringify({ 'wx-user@im.wechat': 'ctx-1' }));
+
+    const host = new FakeHost();
+    await world.start(host);
+    // UTC 21:11 在北京时间（+8）是次日 05:11。
+    const utcMs = Date.parse('2026-10-27T21:11:00.000Z');
+    srv.queue.push({
+      from_user_id: 'wx-user@im.wechat',
+      message_type: 1,
+      create_time_ms: utcMs,
+      context_token: 'ctx-2',
+      item_list: [{ type: 1, text_item: { text: '测试时间' } }],
+    });
+    await waitFor(() => host.events.some((e) => e.type === EVENT_MESSAGE), 5000);
+
+    const state = await world.webUi('zh').invoke!('binding', 'state', []) as Record<string, unknown>;
+    const local = String(state.lastMessageLocal ?? '');
+    // 关键断言：显示的是 05:11，不是 21:11。
+    expect(local).toContain('05:11');
+    expect(local).not.toContain('21:11');
+    expect(local.startsWith('2026-10-28')).toBe(true);
+    await world.stop();
+  });
   it('没有 ffmpeg 时，视频消息写明未抽帧而不是假装看过', async () => {
     const srv = await startFakeServer();
     server = srv;
