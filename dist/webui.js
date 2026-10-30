@@ -1,4 +1,4 @@
-// src/webui/ffmpeg.ts
+// ../../extensions/cortico-world-wechat-claw/src/webui/ffmpeg.ts
 var TEXT = {
   zh: {
     sheet: "ffmpeg",
@@ -160,7 +160,7 @@ async function mountFfmpeg(ctx) {
   await readState();
 }
 
-// src/webui/client.ts
+// ../../extensions/cortico-world-wechat-claw/src/webui/client.ts
 var TEXT2 = {
   zh: {
     sheet: "\u5FAE\u4FE1\u7ED1\u5B9A",

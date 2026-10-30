@@ -1,4 +1,4 @@
-﻿import type { ConfigGroup } from 'cortico/core/types.ts';
+import type { ConfigGroup } from 'cortico/core/types.ts';
 
 /**
  * `config.json` 的 `worlds.wechat-claw` 段。
@@ -59,7 +59,10 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
   schema: {
     type: 'object',
     title: '微信 ClawBot',
-    description: '微信一对一私聊的接入方式与收件范围。绑定状态在「微信绑定」面板。',
+    description:
+      '微信一对一私聊的接入方式与收件范围。绑定状态在「微信绑定」面板。\n'
+      + '⚠ 安全提示：启用后模型能把本机任意文件发到微信，包括它自己的登录令牌，'
+      + '发送前不会向你确认。只在你信任这个微信账号、并清楚可能被发出去什么时启用。',
     properties: {
       'worlds.wechat-claw.networkMode': {
         type: 'string',

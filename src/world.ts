@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 微信 ClawBot World。
  *
  * 一个 iLink 一对一通道：扫码绑定、长轮询收消息、按类型回复文字/图片/文件。
@@ -195,7 +195,6 @@ export class WechatClawWorld implements World {
   #started = false;
   #startedAt = '';
   #lastError = '';
-  #lastUserId = '';
   #lastMessageAt = '';
   #contextCount = 0;
   #networkProblem = '';
@@ -264,13 +263,21 @@ export class WechatClawWorld implements World {
     }
   }
 
-  /** 回复目标：最近一条入站消息的发送者，没有就用绑定账号本人。 */
+  /**
+   * 回复目标：**永远是绑定的微信本人**。
+   *
+   * 不用「最近一条消息的发送者」当目标——那样任何人只要能让一条消息进入收件流
+   * （群聊成员、服务通知、陌生人），回复目标就会被改写成对方，文件和文字都会发错人。
+   * 这个插件只服务一对一私聊，所以收件人钉死在绑定记录里。
+   */
   #replyTarget(): { to: string; contextToken: string } {
     if (!this.#driver || !this.#auth?.token) {
       throw new Error('微信未连接：先在「微信绑定」面板扫码，并确认本 World 已启用。');
     }
-    const to = this.#lastUserId || this.#auth.userId;
-    if (!to) throw new Error('还没有收到过微信消息，等对方先说话。');
+    const to = String(this.#auth.userId ?? '').trim();
+    if (!to) {
+      throw new Error('绑定记录里没有微信用户 ID，无法确定收件人。请在「微信绑定」面板解绑后重新扫码。');
+    }
     return { to, contextToken: '' };
   }
 
@@ -607,7 +614,6 @@ export class WechatClawWorld implements World {
 
     this.#auth = null;
     this.#contextCount = 0;
-    this.#lastUserId = '';
     this.#lastMessageAt = '';
     this.#typingTickets.clear();
     this.#lastError = '';
@@ -1119,6 +1125,37 @@ export class WechatClawWorld implements World {
     });
   }
 
+  /**
+   * 判断一条入站消息的发送者是不是绑定的微信本人。
+   *
+   * 正常绑定会带回 `ilink_user_id`，这里严格比对，不匹配就丢。
+   * 极少数情况下服务端没给这个字段，则把**扫码绑定后第一条消息的发送者**认作本人并持久化
+   * （首次信任：刚扫完码，第一个说话的就是操作者）。认领只发生一次，之后一律严格比对。
+   */
+  #acceptSender(from: string): boolean {
+    const auth = this.#auth;
+    const owner = String(auth?.userId ?? '').trim();
+
+    if (owner) {
+      if (from === owner) return true;
+      this.#host?.log?.warn?.('丢弃非绑定用户发来的微信消息', { from: shortId(from) });
+      return false;
+    }
+
+    // 没有绑定记录，或绑定没带 userId：无法确定本人。
+    if (!auth?.token) {
+      this.#host?.log?.warn?.('未绑定状态下收到微信消息，已丢弃', { from: shortId(from) });
+      return false;
+    }
+
+    auth.userId = from;
+    this.#host?.log?.warn?.('绑定记录缺少微信用户 ID，已把首个发送者认作本人', { userId: shortId(from) });
+    void this.#store.saveAuth(auth).catch((err) => {
+      this.#host?.log?.warn?.('保存微信用户 ID 失败', { error: errorText(err) });
+    });
+    return true;
+  }
+
   async #handleInbound(driver: ILinkDriver, message: WeixinMessage): Promise<void> {
     if (driver !== this.#driver) return;
     // 自己发出去的消息不回到自己这里。
@@ -1126,6 +1163,11 @@ export class WechatClawWorld implements World {
     const from = String(message?.from_user_id ?? '').trim();
     if (!from) return;
     if (this.#auth?.accountId && from === this.#auth.accountId) return;
+
+    // 只接受绑定本人发来的消息。别的人（群成员、服务通知、陌生人）一律丢弃：
+    // 收件人已经钉死在 auth.userId，这里再放行，非本人的内容就会进入上下文，
+    // 并且「回复」的语义会被引到错误的人身上。
+    if (!this.#acceptSender(from)) return;
 
     const contextToken = String(message?.context_token ?? '').trim();
     if (contextToken) {
@@ -1137,7 +1179,6 @@ export class WechatClawWorld implements World {
     }
 
     const atMs = messageTimeMs(message);
-    this.#lastUserId = from;
     this.#lastMessageAt = new Date(atMs).toISOString();
 
     const maxBytes = Math.max(1, Number(this.#cfg.maxInboundMediaMb) || 20) * 1024 * 1024;
