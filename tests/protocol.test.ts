@@ -14,7 +14,7 @@ import {
   encryptAesEcb,
   parseAesKey,
 } from '../src/protocol/crypto.ts';
-import { extensionFromMime, mimeFromFilename, sniffImageMime } from '../src/protocol/mime.ts';
+import { extensionFromMime, imageSize, mimeFromFilename, sniffImageMime } from '../src/protocol/mime.ts';
 import { fileMessage, imageMessage, textMessage } from '../src/protocol/outbound.ts';
 import { MediaTransfer } from '../src/protocol/media.ts';
 import { startFakeServer } from './helpers/fake-server.ts';
@@ -23,7 +23,8 @@ const makeApi = (baseUrl: string, token = 'bot-token-123'): ILinkApi =>
   new ILinkApi({
     baseUrl,
     token,
-    channelVersion: '0.1.0',
+    // 哨兵值：证明请求带的就是配置进来的那个版本，不是别处抄来的常量。
+    channelVersion: '9.9.9-test',
     botAgent: 'Cortico/6 (test)',
     // 二维码登录默认走官方固定地址；测试指到本机假服务端。
     loginBaseUrl: baseUrl,
@@ -177,7 +178,7 @@ describe('ILinkApi 对真端口的请求', () => {
       expect(request?.headers.authorizationtype).toBe('ilink_bot_token');
       expect(typeof request?.headers['x-wechat-uin']).toBe('string');
       const body = JSON.parse(request?.body ?? '{}') as { base_info?: { channel_version?: string } };
-      expect(body.base_info?.channel_version).toBe('0.1.0');
+      expect(body.base_info?.channel_version).toBe('9.9.9-test');
     } finally {
       await server.close();
     }
@@ -299,5 +300,86 @@ describe('MediaTransfer 上传与下载', () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+describe('图片尺寸', () => {
+  /** 拼一段只有帧头的最小 JPEG：SOI、可跳过的段、SOF、SOS。 */
+  const jpeg = (opts: { width: number; height: number; marker?: number; filler?: number }): Buffer => {
+    const marker = opts.marker ?? 0xc2;
+    // 微信的图片在 APP1 里塞了一长段 EXIF，段内容按长度跳过，不能按字节找。
+    const exif = Buffer.alloc(opts.filler ?? 0, 0x28);
+    const app1 = Buffer.concat([Buffer.from([0xff, 0xe1, 0x00, 0x00]), exif]);
+    app1.writeUInt16BE(app1.length - 2, 2);
+    const sof = Buffer.alloc(2 + 2 + 6 + 3);
+    sof.writeUInt8(0xff, 0);
+    sof.writeUInt8(marker, 1);
+    sof.writeUInt16BE(sof.length - 2, 2);
+    sof.writeUInt8(8, 4);
+    sof.writeUInt16BE(opts.height, 5);
+    sof.writeUInt16BE(opts.width, 7);
+    sof.writeUInt8(3, 9);
+    const sos = Buffer.from([0xff, 0xda, 0x00, 0x02]);
+    return Buffer.concat([Buffer.from([0xff, 0xd8]), app1, sof, sos]);
+  };
+
+  it('JPEG 从 SOF 段读尺寸，按段长跳过前面的大段 EXIF', () => {
+    expect(imageSize(jpeg({ width: 868, height: 1920 }))).toEqual({ width: 868, height: 1920 });
+    expect(imageSize(jpeg({ width: 868, height: 1920, filler: 96 }))).toEqual({ width: 868, height: 1920 });
+  });
+
+  it('JPEG 的 baseline 与 progressive 帧头都认', () => {
+    expect(imageSize(jpeg({ width: 640, height: 480, marker: 0xc0 }))).toEqual({ width: 640, height: 480 });
+    expect(imageSize(jpeg({ width: 640, height: 480, marker: 0xc2 }))).toEqual({ width: 640, height: 480 });
+  });
+
+  it('PNG 读 IHDR', () => {
+    const png = Buffer.alloc(33);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
+    png.writeUInt32BE(1440, 16);
+    png.writeUInt32BE(1699, 20);
+    expect(imageSize(png)).toEqual({ width: 1440, height: 1699 });
+  });
+
+  it('GIF 与 BMP 读各自的文件头', () => {
+    const gif = Buffer.alloc(13);
+    Buffer.from('GIF89a', 'ascii').copy(gif, 0);
+    gif.writeUInt16LE(320, 6);
+    gif.writeUInt16LE(240, 8);
+    expect(imageSize(gif)).toEqual({ width: 320, height: 240 });
+
+    const bmp = Buffer.alloc(54);
+    Buffer.from('BM', 'ascii').copy(bmp, 0);
+    bmp.writeUInt32LE(1280, 18);
+    bmp.writeUInt32LE(720, 22);
+    expect(imageSize(bmp)).toEqual({ width: 1280, height: 720 });
+  });
+
+  it('WebP 的 VP8X 与 VP8 都认', () => {
+    const vp8x = Buffer.alloc(30);
+    Buffer.from('RIFF', 'ascii').copy(vp8x, 0);
+    Buffer.from('WEBP', 'ascii').copy(vp8x, 8);
+    Buffer.from('VP8X', 'ascii').copy(vp8x, 12);
+    // 宽高各 24 位，存的是「减一」。
+    vp8x.writeUIntLE(1279 - 1, 24, 3);
+    vp8x.writeUIntLE(2275 - 1, 27, 3);
+    expect(imageSize(vp8x)).toEqual({ width: 1279, height: 2275 });
+
+    const vp8 = Buffer.alloc(30);
+    Buffer.from('RIFF', 'ascii').copy(vp8, 0);
+    Buffer.from('WEBP', 'ascii').copy(vp8, 8);
+    Buffer.from('VP8 ', 'ascii').copy(vp8, 12);
+    vp8[23] = 0x9d;
+    vp8[24] = 0x01;
+    vp8[25] = 0x2a;
+    vp8.writeUInt16LE(800, 26);
+    vp8.writeUInt16LE(600, 28);
+    expect(imageSize(vp8)).toEqual({ width: 800, height: 600 });
+  });
+
+  it('认不出或数据不够时返回 null，不猜', () => {
+    expect(imageSize(Buffer.from('not an image at all'))).toBeNull();
+    expect(imageSize(Buffer.from([0xff, 0xd8]))).toBeNull();
+    expect(imageSize(Buffer.alloc(0))).toBeNull();
   });
 });

@@ -14,6 +14,8 @@ import { fileURLToPath } from 'node:url';
 
 import QRCode from 'qrcode';
 
+import pkg from '../package.json' with { type: 'json' };
+
 import type {
   BlobInput,
   Logger,
@@ -49,7 +51,8 @@ export const EVENT_MESSAGE = 'wechat-claw.message';
 export const EVENT_LINK = 'wechat-claw.link';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
-const PACKAGE_VERSION = '0.1.0';
+/** 版本号只认 package.json；这里再抄一份会漂。 */
+const PACKAGE_VERSION: string = pkg.version;
 /** 发消息时上报的观测标识，形状是 UA 的 `Name/Version`。 */
 const BOT_AGENT = `Cortico/6 (Coopanion; cortico-world-wechat-claw/${PACKAGE_VERSION})`;
 

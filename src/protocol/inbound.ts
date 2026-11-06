@@ -8,7 +8,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { extensionForInbound, mimeFromFilename, sniffImageMime } from './mime.ts';
+import { extensionForInbound, imageSize, mimeFromFilename, sniffImageMime } from './mime.ts';
 import type { MediaTransfer } from './media.ts';
 import { MessageItemType, type MessageItem, type WeixinMessage } from './types.ts';
 
@@ -20,6 +20,9 @@ export interface InboundMedia {
   label: string;
   kind: 'image' | 'file' | 'video' | 'voice';
   bytes: number;
+  /** 图片的真实像素尺寸；读不出文件头时缺省。 */
+  width?: number;
+  height?: number;
 }
 
 /** 一条入站消息渲染后的结果。 */
@@ -200,9 +203,9 @@ export async function renderInbound(
         lines.push(missText(fetched, '图片', opts.maxBytes));
         continue;
       }
-      const dims = item.image_item?.thumb_width && item.image_item?.thumb_height
-        ? ` ${item.image_item.thumb_width}x${item.image_item.thumb_height}`
-        : '';
+      // 尺寸取落盘文件本身。`image_item.thumb_width` 是缩略图尺寸（微信普遍给 210 宽），
+      // 拿它当图片尺寸会让上下文里的数字比真图小一个数量级。
+      const dims = fetched.width && fetched.height ? ` ${fetched.width}x${fetched.height}` : '';
       lines.push(`[图片${dims}，${sizeText(fetched.bytes)}，已存为 ${fetched.path}]`);
       media.push({ ...fetched, kind: 'image', label: `[图片${dims}]` });
       continue;
@@ -255,7 +258,7 @@ export async function renderInbound(
 
 /** 媒体取回的结果：成功给路径，失败给一句能区分原因的话。 */
 type FetchOutcome =
-  | { ok: true; path: string; mime: string; bytes: number }
+  | { ok: true; path: string; mime: string; bytes: number; width?: number; height?: number }
   | { ok: false; reason: 'too-large' | 'no-ref' | 'failed' };
 
 /** 取一个媒体项的字节并按类型落盘。 */
@@ -285,7 +288,14 @@ async function fetchItem(
         dir: join(opts.mediaDir, 'images'),
         prefix: 'wx-image',
       });
-      return { ok: true, path, mime, bytes: bytes.length };
+      const size = imageSize(bytes);
+      return {
+        ok: true,
+        path,
+        mime,
+        bytes: bytes.length,
+        ...(size ? { width: size.width, height: size.height } : {}),
+      };
     }
     if (kind === 'file') {
       const file = item.file_item;

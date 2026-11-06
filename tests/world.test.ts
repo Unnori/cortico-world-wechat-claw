@@ -286,6 +286,53 @@ describe('入站消息', () => {
     await world.stop();
   });
 
+  it('图片尺寸取文件本身，不拿缩略图尺寸冒充', async () => {
+    const srv = await startFakeServer();
+    server = srv;
+    const key = randomBytes(16);
+    // 一张真的 PNG 头：IHDR 里写 1440x1699。
+    const pngBytes = Buffer.alloc(33);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(pngBytes, 0);
+    pngBytes.writeUInt32BE(1440, 16);
+    pngBytes.writeUInt32BE(1699, 20);
+    srv.uploads.set('img-2', { ciphertext: encryptForTest(pngBytes, key), key });
+
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    const authDir = join(scratchDir, 'wechat-claw');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(join(authDir, 'auth.json'), JSON.stringify({
+      token: 'bot-token-123', baseUrl: srv.baseUrl, accountId: 'bot-account@im.bot',
+      userId: 'wx-user@im.wechat', savedAt: new Date().toISOString(),
+    }));
+    writeFileSync(join(authDir, 'context-tokens.json'), JSON.stringify({ 'wx-user@im.wechat': 'ctx-1' }));
+
+    const host = new FakeHost();
+    await world.start(host);
+    srv.queue.push({
+      from_user_id: 'wx-user@im.wechat',
+      message_type: 1,
+      context_token: 'ctx-2',
+      item_list: [{
+        type: 2,
+        image_item: {
+          media: { encrypt_query_param: 'download-param-img-2', aes_key: Buffer.from(key.toString('hex'), 'utf8').toString('base64') },
+          mid_size: pngBytes.length,
+          // 微信的缩略图尺寸，与真图差一个数量级；正文不该用它。
+          thumb_width: 210,
+          thumb_height: 248,
+        },
+      }],
+    });
+    await waitFor(() => host.events.some((e) => e.type === EVENT_MESSAGE), 5000);
+
+    const event = host.events.find((e) => e.type === EVENT_MESSAGE)!;
+    expect(event.text).toContain('[图片 1440x1699');
+    expect(event.text).not.toContain('210x248');
+    const media = (event.meta as { media?: Array<{ label: string }> }).media ?? [];
+    expect(media[0]?.label).toBe('[图片 1440x1699]');
+    await world.stop();
+  });
+
   it('入站文件落盘并写进正文，正文带原文件名与大小', async () => {
     const srv = await startFakeServer();
     server = srv;

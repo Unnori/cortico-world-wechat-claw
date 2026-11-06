@@ -133,6 +133,10 @@ POST 密文到微信 CDN → 从响应头 `x-encrypted-param` 取下载参数 �
 落到 `<dataDir>/wechat-claw/inbox/{images,files,videos,voices}/` → 路径写进事件正文 →
 模型接受该 MIME 时字节作为附件随事件到达。
 
+正文里的图片尺寸读自落盘文件本身（JPEG 的 SOF 段、PNG 的 IHDR 等）。微信消息里的
+`thumb_width` / `thumb_height` 是缩略图尺寸，普遍只有 210 像素宽，和真图差一个数量级，
+所以不用它。
+
 ## 限制
 
 - 只支持 1v1 私聊；没有群聊、好友列表、朋友圈、转账或红包。
