@@ -78,8 +78,38 @@ corepack pnpm add "<这个包所在的绝对路径>"
 | `videoFrames` | `4` | 每条视频抽几帧，0 表示不抽 |
 | `videoFrameMaxEdge` | `640` | 每帧最长边像素 |
 | `ffmpegProxyUrl` | 空 | 下载 ffmpeg 用的代理；留空直连（不继承只给模型用的那条代理） |
+| `segmentEnabled` | `true` | 分段发送：一次回复拆成多条微信消息 |
+| `segmentDelayMode` | `fixed` | `fixed` 固定间隔；`random` 在 `segmentDelayMinSec`~`segmentDelayMaxSec` 之间随机 |
+| `segmentDelayFixedSec` | `2` | 固定间隔，秒 |
+| `segmentDelayMinSec` | `1` | 随机间隔下限，秒 |
+| `segmentDelayMaxSec` | `4` | 随机间隔上限，秒 |
+| `segmentMaxParts` | `12` | 单次最多拆几段，超出并进最后一段 |
+| `segmentMaxTotalSec` | `30` | 累计等待上限，到点不再等但剩下的照常发完 |
 
 `bot_token`、同步游标和 `context_token` 都在 `<dataDir>/wechat-claw/`，不进配置、不进日志、不进事件 `meta.raw`。
+
+## 分段发送
+
+微信里一次吐一大段不像人说话。打开分段发送后，一次回复会拆成几条，一条一条发，条与条之间停顿。
+
+**拆分只算一次**，不会拆两次：
+
+| 文本里有 | 按什么拆 | 分隔符 |
+|---|---|---|
+| 换行 `\n` | 只按换行 | 删掉 |
+| 没有换行，有句号 `。．.` | 只按句号 | 删掉 |
+| 都没有，有 `！？!?…～~` | 只按这些 | **保留** |
+| 都没有 | 整条发 | —— |
+
+换行和句号同时出现时（「三层：\n第一。\n第二。」），按换行拆完就结束，句号留在段内，**不会再多拆一次**。
+
+**为什么删句号**：微信里带句号显得生硬，像在写公文，真人不这么打字。`！？…～` 留着，因为那是语气。
+
+**ASCII `.` 有额外保护**：只在后面跟空白或位于结尾时才当句号。所以 `3.14`、`docs.nonebot.dev`、`report.2026.11.md` 不会被切坏。
+
+**两道上限**：单次最多 `segmentMaxParts` 段，多的并进最后一段；累计等待超过 `segmentMaxTotalSec` 就不再多等，但**剩下的照常发完**（不会因为等不起而漏发）。
+
+不想要就在配置页关掉「分段发送」。
 
 ## 视频抽帧
 

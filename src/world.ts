@@ -38,6 +38,7 @@ import { UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/ty
 import { ILinkDriver } from './driver.ts';
 import { CredentialStore, type AuthRecord } from './store.ts';
 import { pickChannel, splitText } from './text.ts';
+import { segmentDelayMs, segmentDelayOf, splitSegments } from './segment.ts';
 import { ensureFfmpeg, installFfmpeg, installedSize, removeFfmpeg, type FfmpegResolution, type InstallProgress } from './media/ffmpeg.ts';
 import { extractFrames } from './media/frames.ts';
 import {
@@ -200,6 +201,10 @@ export class WechatClawWorld implements World {
   #lastError = '';
   #lastMessageAt = '';
   #contextCount = 0;
+  /** 段间等待的唤醒钩子；stop() 用它打断睡眠。 */
+  #sleepWake: (() => void) | null = null;
+  /** 随机源；测试可替换成定值。 */
+  #random: () => number = Math.random;
   #networkProblem = '';
   #ffmpeg: FfmpegResolution | null = null;
   /** ffmpeg 安装进度；null 表示没在装。 */
@@ -292,6 +297,13 @@ export class WechatClawWorld implements World {
     return token;
   }
 
+  /**
+   * 发一条文本。
+   *
+   * 分两层：先按语义拆（换行 / 句号 / 情绪标点），再对仍超长的段交给 `splitText` 硬切。
+   * 逐条真发，条间按配置等待；累计等待到上限就把剩下的连着发完，并在回执里说明。
+   * 全部发完才返回——回执报「已发送」时不骗人。
+   */
   async #toolSendText(args: Record<string, unknown>): Promise<string> {
     const text = String(args.text ?? '').trim();
     if (!text) throw new Error('text 不能为空。');
@@ -299,14 +311,114 @@ export class WechatClawWorld implements World {
     const contextToken = await this.#requireContextToken(to);
     const api = this.#requireApi();
 
-    const chunks = splitText(text, MAX_TEXT_CHARS);
-    for (const chunk of chunks) {
-      await api.sendMessage(textMessage({ to, text: chunk, contextToken }));
+    const { chunks, merged, waits } = this.#planChunks(text);
+
+    let sleptMs = 0;
+    const maxTotalMs = Math.max(0, Number(this.#cfg.segmentMaxTotalSec) || 0) * 1000;
+    let budgetCut = false;
+
+    for (let i = 0; i < chunks.length; i += 1) {
+      await api.sendMessage(textMessage({ to, text: chunks[i]!, contextToken }));
+
+      const isLast = i === chunks.length - 1;
+      if (isLast) break;
+
+      const waitMs = waits[i] ?? 0;
+      if (waitMs <= 0) continue;
+
+      // 预算不够就**不再等**，但剩下的段必须照常发完——不能因为等不起就不发了。
+      if (maxTotalMs > 0 && sleptMs + waitMs > maxTotalMs) {
+        budgetCut = true;
+        continue;
+      }
+
+      // 下一段之前先亮「正在输入」，让人看着像还在打，而不是卡住。
+      void this.#signalTyping(to, contextToken);
+      await this.#sleepMs(waitMs);
+      sleptMs += waitMs;
     }
-    this.#host?.log?.info?.('微信已发送文本', { to: shortId(to), chars: text.length, parts: chunks.length });
-    const parts = chunks.length > 1 ? `，分 ${chunks.length} 条` : '';
-    return `已发送到微信（${shortId(to)}）${parts}，共 ${text.length} 字。`;
+
+    this.#host?.log?.info?.('微信已发送文本', {
+      to: shortId(to),
+      chars: text.length,
+      parts: chunks.length,
+      merged,
+      sleptMs,
+      budgetCut,
+    });
+
+    const bits: string[] = [];
+    if (chunks.length > 1) bits.push(`分 ${chunks.length} 条`);
+    if (merged) bits.push(`内容过多，已合并到 ${chunks.length} 条`);
+    if (budgetCut) bits.push('等待到上限，其余连着发完');
+    if (sleptMs > 0) bits.push(`共等待 ${(sleptMs / 1000).toFixed(1)} 秒`);
+    const suffix = bits.length ? `，${bits.join('，')}` : '';
+    return `已发送到微信（${shortId(to)}）${suffix}，共 ${text.length} 字。`;
   }
+
+  /**
+   * 把一次回复规划成要发的内容。
+   *
+   * - 语义分段（`splitSegments`）
+   * - 每段仍超 4000 字时交给 `splitText` 再切，保证发得出去
+   * - 总段数超过 `segmentMaxParts` 时，把多出来的并进最后一段
+   * - 给出每段之后该等多久（毫秒）
+   *
+   * 分段关闭时退化成原来的行为：只按长度切、不等。
+   */
+  #planChunks(text: string): { chunks: string[]; waits: number[]; merged: boolean } {
+    const enabled = this.#cfg.segmentEnabled !== false;
+
+    // 语义段 → 长度段。
+    const seedParts = enabled ? splitSegments(text) : [text];
+    let chunks: string[] = [];
+    for (const part of seedParts.length ? seedParts : [text]) {
+      for (const piece of splitText(part, MAX_TEXT_CHARS)) {
+        if (piece) chunks.push(piece);
+      }
+    }
+    if (!chunks.length) chunks = [text];
+
+    // 段数上限：多的并进最后一段。
+    const maxParts = Math.floor(Number(this.#cfg.segmentMaxParts) || 0);
+    let merged = false;
+    if (enabled && maxParts > 0 && chunks.length > maxParts) {
+      const keep = chunks.slice(0, maxParts - 1);
+      const rest = chunks.slice(maxParts - 1).join('');
+      chunks = [...keep, rest];
+      merged = true;
+    }
+
+    // 每段之后的等待；关闭分段时全 0。
+    const waits: number[] = [];
+    if (enabled) {
+      const delay = segmentDelayOf(this.#cfg);
+      for (let i = 0; i < chunks.length - 1; i += 1) {
+        waits.push(segmentDelayMs(delay, i, this.#random));
+      }
+    } else {
+      for (let i = 0; i < chunks.length - 1; i += 1) waits.push(0);
+    }
+
+    return { chunks, waits, merged };
+  }
+
+  /** 等一会儿；`stop()` 时会被唤醒，避免关机干等半分钟。 */
+  #sleepMs(ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.#sleepWake = null;
+        resolve();
+      }, ms);
+      this.#sleepWake = () => {
+        clearTimeout(timer);
+        this.#sleepWake = null;
+        resolve();
+      };
+    });
+  }
+
 
   /**
    * 图片与文件共用一条上传路径，只有 media_type 和消息项不同。
@@ -1314,6 +1426,8 @@ export class WechatClawWorld implements World {
 
   async stop(): Promise<void> {
     this.#started = false;
+    // 打断段间等待，否则关机要干等到间隔结束。
+    this.#sleepWake?.();
     const login = this.#login;
     if (login?.active) login.active = false;
     this.#loginAbort?.abort();

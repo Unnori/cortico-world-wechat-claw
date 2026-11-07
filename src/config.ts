@@ -35,6 +35,25 @@ export interface WechatClawConfigSection {
   videoFrameMaxEdge: number;
   /** 下载 ffmpeg 用的代理；留空表示直连（不继承只给模型用的那条代理）。 */
   ffmpegProxyUrl: string;
+  /**
+   * 按语义分段发送。打开后一次回复会拆成多条微信消息，像人一句一句说。
+   *
+   * 有换行就只按换行拆；没有换行才按句号；再没有才按 `！？…～`。
+   * 中文句号删掉（社交软件里带句号显得生硬），情绪标点保留。
+   */
+  segmentEnabled: boolean;
+  /** 段间等待口径：固定间隔，或在区间内随机。 */
+  segmentDelayMode: 'fixed' | 'random';
+  /** 固定间隔，秒。 */
+  segmentDelayFixedSec: number;
+  /** 随机间隔下限，秒。 */
+  segmentDelayMinSec: number;
+  /** 随机间隔上限，秒。 */
+  segmentDelayMaxSec: number;
+  /** 单次回复最多拆几条；超出就把剩下的合并进最后一条。 */
+  segmentMaxParts: number;
+  /** 一次发送累计等待上限，秒；到点就把剩下的一起发完。 */
+  segmentMaxTotalSec: number;
 }
 
 export const WECHAT_CLAW_DEFAULTS: WechatClawConfigSection = {
@@ -51,6 +70,13 @@ export const WECHAT_CLAW_DEFAULTS: WechatClawConfigSection = {
   videoFrames: 4,
   videoFrameMaxEdge: 640,
   ffmpegProxyUrl: '',
+  segmentEnabled: true,
+  segmentDelayMode: 'fixed',
+  segmentDelayFixedSec: 2,
+  segmentDelayMinSec: 1,
+  segmentDelayMaxSec: 4,
+  segmentMaxParts: 12,
+  segmentMaxTotalSec: 30,
 };
 
 export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
@@ -142,6 +168,54 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
         type: 'number',
         title: '每帧最长边（像素）',
         description: '抽出的帧会缩到这个尺寸再交给模型。越小越省 token，也越看不清细节。',
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.segmentEnabled': {
+        type: 'boolean',
+        title: '分段发送',
+        description:
+          '打开后一次回复拆成多条微信消息，像人一句一句说。'
+          + '有换行就只按换行拆；没有换行才按句号；再没有才按！？…～。'
+          + '中文句号会删掉（社交软件里带句号显得生硬），！？…～ 保留语气。修改后需重启。',
+        'x-hot': false,
+      },
+      'worlds.wechat-claw.segmentDelayMode': {
+        type: 'string',
+        title: '间隔方式',
+        description: '固定间隔，或在区间内随机取值。只在「分段发送」打开时有效。',
+        enum: ['fixed', 'random'],
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.segmentDelayFixedSec': {
+        type: 'number',
+        title: '固定间隔（秒）',
+        description: '每一段发完后等这么久。0 表示连着发完。',
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.segmentDelayMinSec': {
+        type: 'number',
+        title: '随机下限（秒）',
+        description: '随机间隔的下界。和上限写反了会自动换过来。',
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.segmentDelayMaxSec': {
+        type: 'number',
+        title: '随机上限（秒）',
+        description: '随机间隔的上界。',
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.segmentMaxParts': {
+        type: 'number',
+        title: '最多拆几段',
+        description:
+          '单次回复的上限。超出时把多出来的内容并进最后一段，避免模型输出几十行把这次发送拖很久。',
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.segmentMaxTotalSec': {
+        type: 'number',
+        title: '总等待上限（秒）',
+        description:
+          '一次发送里所有间隔加起来的上限。到点就把剩下的一起发完，回执会写明有截断。',
         'x-hot': true,
       },
     },

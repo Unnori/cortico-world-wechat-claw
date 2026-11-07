@@ -1,4 +1,4 @@
-/**
+﻿/**
  * World 层：工具回执、事件形状、入站媒体落地、出站上传、绑定面板与状态。
  *
  * 用真端口、真文件、真事件宿主；只有模型是假的（这里根本不调模型）。
@@ -156,7 +156,7 @@ describe('出站工具', () => {
   it('超长文本自动分段发送，不整条丢掉', async () => {
     const srv = await startFakeServer();
     server = srv;
-    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS, segmentEnabled: false }, dataDir: scratchDir, server: srv });
     const authDir = join(scratchDir, 'wechat-claw');
     mkdirSync(authDir, { recursive: true });
     writeFileSync(join(authDir, 'auth.json'), JSON.stringify({
@@ -598,6 +598,120 @@ describe('入站消息', () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 600));
     expect(host.events.filter((e) => e.type === EVENT_MESSAGE)).toHaveLength(0);
+    await world.stop();
+  });
+});
+
+describe('分段发送', () => {
+  /** 绑定凭据并把 World 跑起来。 */
+  async function ready(cfg: Partial<WechatClawConfigSection> = {}) {
+    const srv = await startFakeServer();
+    server = srv;
+    const authDir = join(scratchDir, 'wechat-claw');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(join(authDir, 'auth.json'), JSON.stringify({
+      token: 'bot-token-123', baseUrl: srv.baseUrl, accountId: 'bot-account@im.bot',
+      userId: 'wx-user@im.wechat', savedAt: new Date().toISOString(),
+    }));
+    writeFileSync(join(authDir, 'context-tokens.json'), JSON.stringify({ 'wx-user@im.wechat': 'ctx-1' }));
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS, ...cfg }, dataDir: scratchDir, server: srv });
+    const host = new FakeHost();
+    await world.start(host);
+    const send = world.tools().find((tool) => tool.name === 'wechat_send')!;
+    return { srv, world, host, send };
+  }
+
+  /** 假服务端收到的文本正文。 */
+  const texts = (srv: FakeServer): string[] =>
+    srv.sent.map((msg) => String((msg.item_list as Array<{ text_item?: { text?: string } }>)[0]?.text_item?.text ?? ''));
+
+  it('按换行拆成多条发送，每条内容正确', async () => {
+    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    await send.handler({ text: '甲\n乙\n丙' }, call);
+    expect(texts(srv)).toEqual(['甲', '乙', '丙']);
+    await world.stop();
+  });
+
+  it('没有换行时按句号拆，且句号被删掉', async () => {
+    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    await send.handler({ text: '今天下雨了。我带了伞。' }, call);
+    expect(texts(srv)).toEqual(['今天下雨了', '我带了伞']);
+    await world.stop();
+  });
+
+  it('情绪标点只拆不删，标点跟着前一段', async () => {
+    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    await send.handler({ text: '真的假的？太好了！' }, call);
+    expect(texts(srv)).toEqual(['真的假的？', '太好了！']);
+    await world.stop();
+  });
+
+  it('固定间隔真的会等', async () => {
+    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0.3 });
+    const started = Date.now();
+    const receipt = String(await send.handler({ text: '甲\n乙' }, call));
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(250);
+    expect(receipt).toContain('共等待');
+    expect(texts(srv)).toEqual(['甲', '乙']);
+    await world.stop();
+  });
+
+  it('关掉分段就恢复成一条发完、不等', async () => {
+    const { srv, world, send } = await ready({ segmentEnabled: false, segmentDelayFixedSec: 5 });
+    const started = Date.now();
+    await send.handler({ text: '甲\n乙。丙' }, call);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(texts(srv)).toHaveLength(1);
+    expect(texts(srv)[0]).toContain('\n');
+    await world.stop();
+  });
+
+  it('段数超过上限时并进最后一段，回执说明合并', async () => {
+    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0, segmentMaxParts: 3 });
+    const receipt = String(await send.handler({ text: 'a\nb\nc\nd\ne' }, call));
+    expect(texts(srv)).toHaveLength(3);
+    expect(texts(srv)[2]).toBe('cde');
+    expect(receipt).toContain('合并');
+    await world.stop();
+  });
+
+  it('总等待到上限就停止等待，剩下的连着发完', async () => {
+    // 每段等 0.25 秒，但总上限只给 0.3 秒：第二条发完就不该再等。
+    const { srv, world, send } = await ready({
+      segmentDelayFixedSec: 0.25, segmentMaxTotalSec: 0.3,
+    });
+    const started = Date.now();
+    const receipt = String(await send.handler({ text: 'a\nb\nc\nd' }, call));
+    const elapsed = Date.now() - started;
+    // 只允许等一次，明显小于「等三次」的 0.75 秒。
+    expect(elapsed).toBeLessThan(600);
+    expect(receipt).toContain('连着发完');
+    expect(texts(srv)).toHaveLength(4);
+    await world.stop();
+  });
+
+  it('随机间隔落在配置区间内', async () => {
+    const { world, send } = await ready({
+      segmentDelayMode: 'random', segmentDelayMinSec: 0.05, segmentDelayMaxSec: 0.2,
+    });
+    const started = Date.now();
+    await send.handler({ text: 'a\nb\nc' }, call);
+    const elapsed = Date.now() - started;
+    // 两段间隔，各不超过 0.2 秒。
+    expect(elapsed).toBeGreaterThanOrEqual(80);
+    expect(elapsed).toBeLessThan(600);
+    await world.stop();
+  });
+
+  it('超长但分段的文本：语义段与长度切分都生效', async () => {
+    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    // 一段 5000 字（超过 4000 上限）+ 一段短的。
+    const long = '甲'.repeat(5000);
+    await send.handler({ text: `${long}\n乙` }, call);
+    const out = texts(srv);
+    expect(out.length).toBeGreaterThanOrEqual(3);
+    for (const piece of out) expect(piece.length).toBeLessThanOrEqual(4000);
     await world.stop();
   });
 });
