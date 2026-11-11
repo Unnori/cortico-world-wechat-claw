@@ -3,6 +3,10 @@
 
 通过微信 ClawBot（iLink）和 Coopanion 桌宠一对一聊天。**文字、图片、文件双向收发。**
 
+文件这条路是这么走的：微信里发来的东西**落在桌宠自己的工作区里**（`wechat-inbox/`），所以它读得到、
+改得了、也能改完再发回去；反过来，**能发到微信的只有工作区里的文件**——工作区外面（凭据、系统目录、
+浏览器数据）不在范围里，模型再被说服也上传不出去。
+
 这是独立开发的实现，不复用 `cortico-world-clawbot` 的代码。协议形状对齐腾讯官方
 [`@tencent-weixin/openclaw-weixin`](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin)
 2.4.10 与它的[后端协议文档](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol_zh_CN.md)。
@@ -12,11 +16,12 @@
 | | 现成 `cortico-world-clawbot` 0.1.0 | 这个扩展 |
 |---|---|---|
 | 文本收发 | 支持 | 支持 |
-| 收图片 | 只显示 `[图片]` 占位 | 下载解密到本地，路径进上下文，模型支持图片时作为附件到达 |
-| 发图片 | 不支持 | `wechat_send_image`：加密上传到微信 CDN 再发 |
-| 收文件 | 只显示 `[文件 名字]` 占位 | 下载解密到本地，路径进上下文 |
-| 发文件 | 不支持 | `wechat_send_file`：同上，带原文件名与明文长度 |
-| 语音 | 占位 | 优先用服务端转写文本；语音文件本身落盘 |
+| 收图片 | 只显示 `[图片]` 占位 | 解密落到桌宠工作区的 `wechat-inbox/images/`，路径进上下文，模型支持图片时作为附件到达 |
+| 发图片 | 不支持 | `wechat_send_image`：加密上传到微信 CDN 再发；**路径必须在工作区内** |
+| 收文件 | 只显示 `[文件 名字]` 占位 | 解密落到 `wechat-inbox/files/`，保留对方给的原文名；她读得到、改得了，也能原样发回去 |
+| 发文件 | 不支持 | `wechat_send_file`：同上，带原文件名与明文长度；同样只限工作区 |
+| 上传来源 | —— | 只限工作区＋收件目录＋`sendExtraDirs`；先 `realpath` 再判定，`..` 与符号链接都绕不出去 |
+| 语音 | 占位 | 优先用服务端转写文本；语音本身落到 `wechat-inbox/voices/` |
 | 长文本 | 超 4000 字被拒 | 自动切成多条发送，优先在段落与句号处断开 |
 | 出站视频 | 不支持 | 按 MIME 走视频通道，微信里显示成视频而不是附件 |
 | 入站超限 | 无区分 | 超限、缺参数、下载失败三种原因分别措辞 |
@@ -30,9 +35,9 @@
 | 工具 | 作用 |
 |---|---|
 | `wechat_send` | 回复最近一条微信消息；只能发给刚发消息的人，单条上限 4000 字 |
-| `wechat_send_image` | 把本地一张图发到微信，可带一句说明 |
-| `wechat_send_file` | 把本地一个文件发到微信，可带一句说明 |
-| `wechat_status` | 连接、账号、最近消息、错误、持有多少条会话令牌 |
+| `wechat_send_image` | 把工作区里的一张图发到微信，可带一句说明；工作区外的路径直接拒绝 |
+| `wechat_send_file` | 把工作区里的一个文件发到微信，可带一句说明；同样只限工作区 |
+| `wechat_status` | 连接、账号、最近消息、错误、持有多少条会话令牌，以及工作区/收件目录/允许发送的目录 |
 | `wechat_events` | 按类型和时间查已归档的微信事件 |
 
 | 事件 | 作用 |
@@ -46,8 +51,10 @@
 
 ```bash
 cd %APPDATA%\Coopanion\extensions
-corepack pnpm add "<这个包所在的绝对路径>"
+corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cortico-world-wechat-claw>"
 ```
+
+这条说的是**安装本地包**要填包所在目录的绝对路径，与「发出去的文件路径」无关。
 
 装好不等于启用：配置段默认 `enabled: false`，要去 World 总览激活。
 
@@ -121,7 +128,7 @@ corepack pnpm add "<这个包所在的绝对路径>"
 这是本扩展的安全边界：`wechat_send_image` 和 `wechat_send_file` 只接受**工作区、收件目录，
 以及 `sendExtraDirs` 里额外放行的目录**内的路径。
 
-理由很实在：模型能被说服。把本机任意路径交给它，等于把 `auth.json`、`context-tokens.json`、
+理由很实在：模型能被说服。原来把本机任意路径交给它，等于把 `auth.json`、`context-tokens.json`、
 浏览器 cookie 一起交出去。现在这些文件在工作区外面，边界一挡就拿不到了。
 
 - 判断前先做 `realpath`，所以 `..` 和符号链接都绕不出去。
@@ -261,6 +268,7 @@ AES-128-ECB 加密 → POST 密文到微信 CDN → 从响应头 `x-encrypted-pa
 
 - 只支持 1v1 私聊；没有群聊、好友列表、朋友圈、转账或红包。
 - 只能回复，不能主动发起会话。回复需要对方最近一条消息的 `context_token`，约 24 小时后失效。
+- **只能发工作区里的文件**。要发外面的素材，先把目录写进 `sendExtraDirs`，或把文件复制进工作区。
 - 单条文本上限 4000 字；更长的回复由扩展自动分条，断行优先落在段落与句号上。
 - 微信语音是 SILK 编码，本扩展只落盘不解码；语音转文字用服务端给的 `voice_item.text`。没有转写时模型只知道时长。
 - 视频抽帧需要 ffmpeg；没有可用 ffmpeg 时不抽帧，正文会写明。不做音频转写。
