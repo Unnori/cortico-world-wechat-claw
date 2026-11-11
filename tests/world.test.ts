@@ -1,4 +1,4 @@
-﻿/**
+/**
  * World 层：工具回执、事件形状、入站媒体落地、出站上传、绑定面板与状态。
  *
  * 用真端口、真文件、真事件宿主；只有模型是假的（这里根本不调模型）。
@@ -71,6 +71,8 @@ function makeWorld(opts: {
 }): WechatClawWorld {
   return new WechatClawWorld({
     cfg: opts.cfg,
+    // 测试里部署根就是临时目录：工作区按 `<botDir>/workspace` 探测不到时落到 `<botDir>/memory`。
+    botDir: opts.dataDir,
     dataDir: opts.dataDir,
     timezone: 'Asia/Shanghai',
     endpoints: { apiBaseUrl: opts.server.baseUrl, cdnBaseUrl: opts.server.cdnBaseUrl },
@@ -122,6 +124,7 @@ describe('定义与声明', () => {
   it('环境提示词里的占位符都有值，渲染后不残留', async () => {
     const world = new WechatClawWorld({
       cfg: { ...WECHAT_CLAW_DEFAULTS },
+      botDir: scratchDir,
       dataDir: scratchDir,
       timezone: 'Asia/Shanghai',
     });
@@ -146,6 +149,7 @@ describe('出站工具', () => {
   it('未绑定时发文本给出可执行的提示，而不是抛原始错误', async () => {
     const world = new WechatClawWorld({
       cfg: { ...WECHAT_CLAW_DEFAULTS },
+      botDir: scratchDir,
       dataDir: scratchDir,
       timezone: 'Asia/Shanghai',
     });
@@ -370,7 +374,16 @@ describe('入站消息', () => {
     expect(event.text).toContain('报告.pdf');
     const pathMatch = event.text.match(/已存为 ([^\]]+?)\]/);
     expect(pathMatch).toBeTruthy();
-    expect(readFileSync(pathMatch![1]).equals(pdfBytes)).toBe(true);
+    const savedPath = pathMatch![1];
+    expect(readFileSync(savedPath).equals(pdfBytes)).toBe(true);
+
+    // 落盘位置必须是桌宠工作区里的收件目录，不是插件自己的数据目录——
+    // 只有落在这里，桌宠才读得到、改得了、发得回去。
+    const inbox = world.envPromptVars()['wechat.inbox']!;
+    expect(savedPath.startsWith(inbox)).toBe(true);
+    expect(savedPath).toContain(join('wechat-inbox', 'files'));
+    // 文件名保留原文名，后面接时间戳。
+    expect(savedPath).toMatch(/报告-\d{8}-\d{6}\.pdf$/);
     await world.stop();
   });
 

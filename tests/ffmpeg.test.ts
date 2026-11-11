@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ffmpeg 的解析与显式安装。
  *
  * 核心不变式：**解析永不下载**，只有 `installFfmpeg`（面板按钮）才会联网。
@@ -21,7 +21,7 @@ import {
   probeFfmpeg,
   removeFfmpeg,
 } from '../src/media/ffmpeg.ts';
-import { extractFrames } from '../src/media/frames.ts';
+import { extractFrameStrip } from '../src/media/frames.ts';
 
 let scratchDir = '';
 
@@ -263,80 +263,127 @@ describe('probeFfmpeg', () => {
   });
 });
 
-describe('extractFrames', () => {
-  it('没有 ffmpeg 时返回空帧与原因，不抛错', async () => {
-    const result = await extractFrames({
+describe('extractFrameStrip', () => {
+  it('没有 ffmpeg 时如实失败，不抛错', async () => {
+    const result = await extractFrameStrip({
       ffmpegPath: null,
       videoPath: join(scratchDir, 'x.mp4'),
-      outDir: join(scratchDir, 'frames'),
-      count: 4,
-      maxEdge: 640,
+      outDir: join(scratchDir, 'strip'),
+      frames: 4,
     });
-    expect(result.frames).toEqual([]);
-    expect(result.reason).toContain('ffmpeg');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('ffmpeg');
   });
 
   it('视频文件不存在时如实失败', async () => {
     const ffmpeg = realFfmpeg();
     if (!ffmpeg) return;
-    const result = await extractFrames({
+    const result = await extractFrameStrip({
       ffmpegPath: ffmpeg,
       videoPath: join(scratchDir, 'missing.mp4'),
-      outDir: join(scratchDir, 'frames'),
-      count: 2,
-      maxEdge: 320,
+      outDir: join(scratchDir, 'strip'),
+      frames: 4,
     });
-    expect(result.frames).toEqual([]);
-    expect(result.reason.length).toBeGreaterThan(0);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason.length).toBeGreaterThan(0);
   });
 
-  it('真 ffmpeg：从测试视频抽出请求的帧数，且是有效 JPEG', async () => {
+  it('真 ffmpeg：横屏视频拼成 2×2 田字格', async () => {
     const ffmpeg = realFfmpeg();
     if (!ffmpeg) return;
 
-    const videoPath = join(scratchDir, 'clip.mp4');
+    const videoPath = join(scratchDir, 'land.mp4');
     const made = spawnSync(ffmpeg, [
       '-hide_banner', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'testsrc=duration=4:size=160x120:rate=10',
+      '-f', 'lavfi', '-i', 'testsrc=duration=8:size=640x360:rate=10',
       '-pix_fmt', 'yuv420p', '-y', videoPath,
     ], { windowsHide: true });
     if (made.status !== 0) return;
 
-    const result = await extractFrames({
+    const result = await extractFrameStrip({
       ffmpegPath: ffmpeg,
       videoPath,
-      outDir: join(scratchDir, 'frames'),
-      count: 3,
-      maxEdge: 320,
-      durationSec: 4,
+      outDir: join(scratchDir, 'strip'),
+      frames: 4,
+      durationSec: 8,
     });
-    expect(result.reason).toBe('');
-    expect(result.frames).toHaveLength(3);
-    for (const frame of result.frames) {
-      expect(frame.bytes).toBeGreaterThan(500);
-      const head = createReadStream(frame.path);
-      const first = await new Promise<Buffer>((resolve) => {
-        head.once('data', (chunk) => {
-          resolve(Buffer.from(chunk as Buffer).subarray(0, 3));
-          head.destroy();
-        });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    // 横屏走网格，不该是 1 行。
+    expect(result.strip.cols).toBe(2);
+    expect(result.strip.rows).toBe(2);
+    expect(result.strip.frames).toBe(4);
+    // 只有一张图，不是四张。
+    const files = readdirSync(join(scratchDir, 'strip')).filter((n) => n.endsWith('.jpg'));
+    expect(files).toHaveLength(1);
+    // 是有效 JPEG。
+    const head = createReadStream(result.strip.path);
+    const first = await new Promise<Buffer>((resolve) => {
+      head.once('data', (chunk) => {
+        resolve(Buffer.from(chunk as Buffer).subarray(0, 3));
+        head.destroy();
       });
-      expect([...first]).toEqual([0xff, 0xd8, 0xff]);
-    }
+    });
+    expect([...first]).toEqual([0xff, 0xd8, 0xff]);
   });
 
-  it('上一次的残帧不会被当成本次结果', async () => {
-    const outDir = join(scratchDir, 'frames');
-    mkdirSync(outDir, { recursive: true });
-    writeFileSync(join(outDir, 'frame-001.jpg'), Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+  it('真 ffmpeg：竖屏视频横排成 4×1', async () => {
+    const ffmpeg = realFfmpeg();
+    if (!ffmpeg) return;
 
-    const result = await extractFrames({
+    const videoPath = join(scratchDir, 'port.mp4');
+    const made = spawnSync(ffmpeg, [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=8:size=360x640:rate=10',
+      '-pix_fmt', 'yuv420p', '-y', videoPath,
+    ], { windowsHide: true });
+    if (made.status !== 0) return;
+
+    const result = await extractFrameStrip({
+      ffmpegPath: ffmpeg,
+      videoPath,
+      outDir: join(scratchDir, 'strip2'),
+      frames: 4,
+      durationSec: 8,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.strip.rows).toBe(1);
+    expect(result.strip.cols).toBe(4);
+    expect(result.strip.orderNote).toContain('从左到右');
+  });
+
+  it('帧数上限被夹到 9', async () => {
+    const ffmpeg = realFfmpeg();
+    if (!ffmpeg) return;
+    const videoPath = join(scratchDir, 'clip9.mp4');
+    const made = spawnSync(ffmpeg, [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=6:size=320x180:rate=10',
+      '-pix_fmt', 'yuv420p', '-y', videoPath,
+    ], { windowsHide: true });
+    if (made.status !== 0) return;
+
+    const result = await extractFrameStrip({
+      ffmpegPath: ffmpeg,
+      videoPath,
+      outDir: join(scratchDir, 'strip9'),
+      frames: 20,
+      durationSec: 6,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.strip.frames).toBe(9);
+  });
+
+  it('拼图读取失败时不留下空文件引用', async () => {
+    const result = await extractFrameStrip({
       ffmpegPath: null,
       videoPath: join(scratchDir, 'x.mp4'),
-      outDir,
-      count: 2,
-      maxEdge: 320,
+      outDir: join(scratchDir, 'none'),
+      frames: 2,
     });
-    expect(result.frames).toEqual([]);
+    expect(result.ok).toBe(false);
   });
 });

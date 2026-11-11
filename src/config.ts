@@ -24,15 +24,33 @@ export interface WechatClawConfigSection {
   /** 单条入站媒体上限，MB。超过只留占位，不下载。 */
   maxInboundMediaMb: number;
   /**
+   * 收来的文件落在哪。留空 = 桌宠工作区下的 `wechat-inbox`。
+   *
+   * 相对路径按工作区解析；写绝对路径也能用，但桌宠就读不到了——所以默认值刻意选在工作区里。
+   * 改完要重启（启动时解析一次）。
+   */
+  inboxDir: string;
+  /**
+   * 额外允许发到微信的目录，一行一个（也可用分号或逗号分隔）。
+   *
+   * 留空时**只有工作区和收件目录**里的文件能发出去。填了才会多放行这些目录；
+   * 相对路径按部署目录解析。这是放开安全边界，不是日常必填项。
+   */
+  sendExtraDirs: string;
+  /**
    * ffmpeg 从哪来。视频抽帧需要它，但不把它打进包里：
    * `auto` 先找 PATH 再用面板装的那份；`path` 只用 PATH；`off` 不抽帧。
    * 下载不由这个值触发，只能由面板按钮显式开始。
    */
   ffmpegSource: 'auto' | 'path' | 'off';
-  /** 每条视频抽几帧。0 表示不抽。 */
+  /** 每条视频抽几帧（1..9），抽完拼成一张图。0 表示不抽。 */
   videoFrames: number;
-  /** 每帧最长边像素。 */
-  videoFrameMaxEdge: number;
+  /** 单图体积上限，MB。超了先压缩，压不下去就不附。 */
+  imageMaxMb: number;
+  /** 单图最长边上限，像素。 */
+  imageMaxEdge: number;
+  /** 一次事件投递最多附几张图。 */
+  imageMaxCount: number;
   /** 下载 ffmpeg 用的代理；留空表示直连（不继承只给模型用的那条代理）。 */
   ffmpegProxyUrl: string;
   /**
@@ -66,9 +84,13 @@ export const WECHAT_CLAW_DEFAULTS: WechatClawConfigSection = {
   receiveVideos: false,
   receiveVoices: true,
   maxInboundMediaMb: 20,
+  inboxDir: '',
+  sendExtraDirs: '',
   ffmpegSource: 'auto',
   videoFrames: 4,
-  videoFrameMaxEdge: 640,
+  imageMaxMb: 16,
+  imageMaxEdge: 4096,
+  imageMaxCount: 10,
   ffmpegProxyUrl: '',
   segmentEnabled: true,
   segmentDelayMode: 'fixed',
@@ -87,9 +109,30 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
     title: '微信 ClawBot',
     description:
       '微信一对一私聊的接入方式与收件范围。绑定状态在「微信绑定」面板。\n'
-      + '⚠ 安全提示：启用后模型能把本机任意文件发到微信，包括它自己的登录令牌，'
-      + '发送前不会向你确认。只在你信任这个微信账号、并清楚可能被发出去什么时启用。',
+      + '收到的文件落在桌宠工作区的收件目录里（默认 `wechat-inbox`），它能读、能改、也能发回来；\n'
+      + '发出去的文件只能取自工作区，本机其他位置不会被发到微信。',
     properties: {
+      'worlds.wechat-claw.inboxDir': {
+        type: 'string',
+        title: '收件目录',
+        description:
+          '收到的图片、文件、视频、语音存在这里。留空＝桌宠工作区下的 `wechat-inbox`（推荐，'
+          + '这样桌宠读得到、改得了，也能原样发回去）。'
+          + '相对路径按工作区解析；填绝对路径也可以，但放在工作区外面桌宠就读不到了。'
+          + '目录和它下面的 images/files/videos/voices 会自动创建。修改后需重启。',
+        'x-path': { kind: 'directory' },
+        'x-hot': false,
+      },
+      'worlds.wechat-claw.sendExtraDirs': {
+        type: 'string',
+        title: '额外允许发送的目录',
+        description:
+          '留空即可。默认只有工作区（和上面的收件目录）里的文件能发到微信，避免把登录凭据之类的'
+          + '本机文件发出去。确实要发工作区以外的文件时，把那些目录写在这里，一行一个'
+          + '（分号或逗号也行）；相对路径按部署目录解析。每加一个目录，能发出去的东西就多一片，'
+          + '请只写你自己放素材的目录。',
+        'x-hot': true,
+      },
       'worlds.wechat-claw.networkMode': {
         type: 'string',
         title: '网络出口',
@@ -119,7 +162,9 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
       'worlds.wechat-claw.receiveFiles': {
         type: 'boolean',
         title: '收文件',
-        description: '打开后，对方发来的文件会下载到本地，路径写进上下文，模型可自行读取。',
+        description:
+          '打开后，对方发来的文件会下载到收件目录（默认工作区下的 `wechat-inbox/files`），'
+          + '路径写进上下文，模型可自行读取、修改，也能用 `wechat_send_file` 发回去。',
         'x-hot': true,
       },
       'worlds.wechat-claw.receiveVideos': {
@@ -153,7 +198,11 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
       'worlds.wechat-claw.videoFrames': {
         type: 'number',
         title: '每条视频抽几帧',
-        description: '0 表示不抽帧。帧越多越费 token；4 帧够看清视频在讲什么。',
+        description:
+          '0 表示不抽帧，最多 9 帧。抽出的帧会拼成一张图交给模型，不是分成多张。'
+          + '这些都是代价，不是免费的：帧数越多，ffmpeg 解码和拼接越慢（9 帧明显比 4 帧慢），'
+          + '每格画面也被压得越小，细节丢得越多。'
+          + '4 帧够看清「视频在讲什么」，想追踪连续动作才往上加。',
         'x-hot': true,
       },
       'worlds.wechat-claw.ffmpegProxyUrl': {
@@ -164,10 +213,28 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
           + '拿它连 GitHub 会失败，所以这里单独配。国内直连不通时填 http://127.0.0.1:7890 之类。修改后需重启。',
         'x-hot': false,
       },
-      'worlds.wechat-claw.videoFrameMaxEdge': {
+      'worlds.wechat-claw.imageMaxMb': {
         type: 'number',
-        title: '每帧最长边（像素）',
-        description: '抽出的帧会缩到这个尺寸再交给模型。越小越省 token，也越看不清细节。',
+        title: '单图体积上限（MB）',
+        description:
+          '超过就先压缩；没有 ffmpeg 或压不下去就不附，正文会写明体积超了多少。'
+          + '默认 16，比上游 32 MB 的硬限制更保守。',
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.imageMaxEdge': {
+        type: 'number',
+        title: '单图最长边上限（像素）',
+        description:
+          '超过就先缩小；缩不下去就不附，正文会写明实际尺寸。'
+          + '默认 4096，比上游 8192 的硬限制更保守。',
+        'x-hot': true,
+      },
+      'worlds.wechat-claw.imageMaxCount': {
+        type: 'number',
+        title: '单次最多附几张图',
+        description:
+          '一次事件投递里累计计算，包括图片消息和视频拼图。超出的不附，正文逐张写明是第几张超了。'
+          + '默认 10，比上游 15 张的硬限制更保守。',
         'x-hot': true,
       },
       'worlds.wechat-claw.segmentEnabled': {

@@ -1,38 +1,63 @@
 /**
- * 视频抽帧。
+ * 视频抽帧 → 拼成一张图。
  *
- * 用 ffmpeg 按时间均匀取若干帧，缩放后存成 JPEG，交给模型当图片看。
- * ffmpeg 不存在时返回空数组并给出原因——调用方据此把「没抽帧」写进上下文，不假装看过视频。
+ * 直接把「抽帧 + 缩放 + 拼接」交给 ffmpeg 一条命令完成：它一次解码、按 `tile` 摆好网格，
+ * 比先存 N 张再拼快得多，也不会在磁盘上留下中间文件。
+ *
+ * ## 为什么拼成一张
+ *
+ * 每张独立画面都是一次图片输入。4 帧独立发就是 4 份 token；拼成一张只有 1 份，
+ * 而且模型看到的是时间相邻的画面，比散图更容易判断「发生了什么变化」。
+ *
+ * ## 布局
+ *
+ * 帧数由用户自定义（最多 9），布局跟着帧数走、方向跟着视频走：
+ * 竖屏横排、横屏网格。空格由 `tile` 自动补黑。详见 `layout.ts`。
+ *
+ * ## 失败就说清楚
+ *
+ * 没有 ffmpeg、读不到分辨率、ffmpeg 退出码非零，都返回原因字符串，
+ * 调用方把它写进正文——**不假装看过视频**。
  */
 import { spawn } from 'node:child_process';
-import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-export interface FrameExtraction {
-  /** 抽到的帧：本地路径与尺寸。 */
-  frames: Array<{ path: string; bytes: number }>;
-  /** 没抽成的原因；抽到了就是空串。 */
-  reason: string;
+import { MAX_FRAMES, parseVideoSize, tileLayout, tileOrderNote } from './layout.ts';
+
+export interface FrameStrip {
+  /** 拼好的那张图的本地路径。 */
+  path: string;
+  /** 字节数。 */
+  bytes: number;
+  /** 图片 MIME。 */
+  mime: string;
+  /** 帧数、行列与顺序说明；写进正文让模型知道怎么读这张图。 */
+  frames: number;
+  cols: number;
+  rows: number;
+  /** 视频原本的尺寸；读不到时为 null。 */
+  videoSize: { width: number; height: number } | null;
+  /** 顺序说明，例如「2列×2行，从左上到右下按时间顺序」。 */
+  orderNote: string;
 }
 
-export interface ExtractFramesOptions {
+export interface ExtractStripOptions {
   ffmpegPath: string | null;
   videoPath: string;
-  /** 帧放哪。 */
+  /** 拼图放哪。 */
   outDir: string;
-  /** 取几帧。 */
-  count: number;
-  /** 每帧最长边缩到多少像素。 */
-  maxEdge: number;
-  /** 单帧 JPEG 质量，2 最好 31 最差。 */
-  quality?: number;
-  /** 视频时长（秒）；不知道就传 0，由 ffmpeg 自己找关键帧。 */
+  /** 抽几帧，1..9。 */
+  frames: number;
+  /** 不知道时长时传 0，由 ffmpeg 自己按关键帧挑。 */
   durationSec?: number;
   timeoutMs?: number;
 }
 
-/** 跑 ffmpeg，返回退出码；超时按失败处理并杀掉进程。 */
-function runFfmpeg(args: string[], timeoutMs: number): Promise<{ code: number; stderr: string }> {
+const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/** 跑 ffmpeg，返回退出码与 stderr。 */
+function run(args: string[], timeoutMs: number): Promise<{ code: number; stderr: string }> {
   return new Promise((resolve) => {
     let settled = false;
     let stderr = '';
@@ -45,7 +70,7 @@ function runFfmpeg(args: string[], timeoutMs: number): Promise<{ code: number; s
     try {
       child = spawn(args[0]!, args.slice(1), { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
     } catch (err) {
-      resolve({ code: -1, stderr: err instanceof Error ? err.message : String(err) });
+      done(-1);
       return;
     }
     const timer = setTimeout(() => {
@@ -54,15 +79,15 @@ function runFfmpeg(args: string[], timeoutMs: number): Promise<{ code: number; s
       } catch {
         /* 已退出。 */
       }
+      stderr += '\n（超时）';
       done(-1);
     }, timeoutMs);
     child.stderr?.on('data', (chunk: Buffer) => {
-      // 只留最后一段，够写失败原因就行。
       stderr = (stderr + chunk.toString('utf8')).slice(-2000);
     });
     child.on('error', (err) => {
       clearTimeout(timer);
-      stderr = err.message;
+      stderr = message(err);
       done(-1);
     });
     child.on('close', (code) => {
@@ -73,76 +98,82 @@ function runFfmpeg(args: string[], timeoutMs: number): Promise<{ code: number; s
 }
 
 /**
- * 抽帧。失败时返回空数组与原因，不抛错。
+ * 读视频尺寸。
  *
- * 用 `fps` 表达式按「总时长 / 帧数」采样，比 `-vf select` 的关键帧模式更可控：
- * 视频没有关键帧元数据时也能出帧。
+ * ffmpeg-static 不带 ffprobe，只能 `ffmpeg -i` 然后从 stderr 里解析 `1920x1080`。
+ * 这条命令故意失败（没有输出参数），所以退出码非零是正常的，只看 stderr。
  */
-export async function extractFrames(opts: ExtractFramesOptions): Promise<FrameExtraction> {
-  if (!opts.ffmpegPath) {
-    return { frames: [], reason: '没有可用的 ffmpeg' };
-  }
-  const count = Math.max(1, Math.min(12, Math.floor(opts.count) || 4));
-  const maxEdge = Math.max(64, Math.min(2048, Math.floor(opts.maxEdge) || 640));
-  const quality = Math.max(2, Math.min(31, Math.floor(opts.quality ?? 4)));
-  const timeoutMs = opts.timeoutMs ?? 60_000;
+async function probeVideo(ffmpegPath: string, videoPath: string, timeoutMs: number): Promise<{ width: number; height: number } | null> {
+  const result = await run([
+    ffmpegPath, '-hide_banner', '-i', videoPath,
+  ], Math.min(timeoutMs, 15_000));
+  return parseVideoSize(result.stderr);
+}
+
+/**
+ * 抽帧并拼成一张图。
+ *
+ * 失败时返回 `{ ok: false, reason }`，绝不抛错。
+ */
+export async function extractFrameStrip(
+  opts: ExtractStripOptions,
+): Promise<{ ok: true; strip: FrameStrip; note: string } | { ok: false; reason: string }> {
+  if (!opts.ffmpegPath) return { ok: false, reason: '没有可用的 ffmpeg' };
+
+  const wanted = Math.max(1, Math.min(MAX_FRAMES, Math.floor(opts.frames) || 4));
+  const timeoutMs = opts.timeoutMs ?? 30_000;
 
   try {
     await mkdir(opts.outDir, { recursive: true });
   } catch (err) {
-    return { frames: [], reason: `建不了抽帧目录：${message(err)}` };
+    return { ok: false, reason: `建不了抽帧目录：${message(err)}` };
   }
 
-  // 先清掉上一次的残留，免得把旧帧当成本次的。
-  try {
-    for (const name of await readdir(opts.outDir)) {
-      if (name.startsWith('frame-')) await rm(join(opts.outDir, name), { force: true });
-    }
-  } catch {
-    /* 目录本来就没有。 */
-  }
+  const size = await probeVideo(opts.ffmpegPath, opts.videoPath, timeoutMs);
+  const portrait = size ? size.height > size.width : false;
+  const layout = tileLayout(wanted, portrait);
 
   const duration = Number(opts.durationSec ?? 0);
-  // 均匀采样：整个视频铺 count 个采样点。时长未知时退化成每秒一帧再截断。
-  const filter = duration > 0
-    ? `fps=${(count / duration).toFixed(6)},scale='min(${maxEdge},iw)':'min(${maxEdge},ih)':force_original_aspect_ratio=decrease`
-    : `fps=1,scale='min(${maxEdge},iw)':'min(${maxEdge},ih)':force_original_aspect_ratio=decrease`;
+  // 采样：时长已知就按「帧数/时长」铺满全程；未知时每秒一帧再截断。
+  const fps = duration > 0 ? `${wanted}/${duration}` : '1';
+  const filter = [
+    `fps=${fps}`,
+    `scale='min(${layout.cellEdge},iw)':'min(${layout.cellEdge},ih)':force_original_aspect_ratio=decrease`,
+    `tile=${layout.cols}x${layout.rows}`,
+  ].join(',');
 
-  const outPattern = join(opts.outDir, 'frame-%03d.jpg');
-  const args = [
+  const target = join(opts.outDir, `strip-${Date.now().toString(36)}.jpg`);
+  const result = await run([
     opts.ffmpegPath,
-    '-hide_banner',
-    '-loglevel', 'error',
+    '-hide_banner', '-loglevel', 'error',
     '-i', opts.videoPath,
     '-vf', filter,
-    '-frames:v', String(count),
-    '-q:v', String(quality),
-    '-y',
-    outPattern,
-  ];
+    '-frames:v', '1',
+    '-q:v', '3',
+    '-y', target,
+  ], timeoutMs);
 
-  const result = await runFfmpeg(args, timeoutMs);
   if (result.code !== 0) {
-    return { frames: [], reason: `ffmpeg 退出码 ${result.code}${result.stderr ? `：${result.stderr.trim().slice(-300)}` : ''}` };
+    return { ok: false, reason: `ffmpeg 退出码 ${result.code}${result.stderr ? `：${result.stderr.trim().slice(-200)}` : ''}` };
   }
 
-  try {
-    const names = (await readdir(opts.outDir))
-      .filter((name) => /^frame-\d+\.jpg$/.test(name))
-      .sort();
-    if (!names.length) return { frames: [], reason: 'ffmpeg 没有产出帧' };
+  const info = await stat(target).catch(() => null);
+  if (!info || info.size === 0) return { ok: false, reason: 'ffmpeg 没有产出拼图' };
 
-    const frames: Array<{ path: string; bytes: number }> = [];
-    for (const name of names.slice(0, count)) {
-      const path = join(opts.outDir, name);
-      const bytes = await readFile(path).catch(() => null);
-      if (bytes) frames.push({ path, bytes: bytes.length });
-    }
-    if (!frames.length) return { frames: [], reason: '抽出的帧读不出来' };
-    return { frames, reason: '' };
-  } catch (err) {
-    return { frames: [], reason: `读不到抽帧结果：${message(err)}` };
-  }
+  const orderNote = tileOrderNote(layout);
+  const scaleNote = `每格约 ${layout.cellEdge}px，整图约 ${layout.width}×${layout.height}`;
+  return {
+    ok: true,
+    strip: {
+      path: target,
+      bytes: info.size,
+      mime: 'image/jpeg',
+      frames: wanted,
+      cols: layout.cols,
+      rows: layout.rows,
+      videoSize: size,
+      orderNote,
+    },
+    note: `拼图 ${layout.cols}×${layout.rows}（${wanted} 帧，${orderNote}；${scaleNote}）`,
+  };
 }
-
-const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));

@@ -27,14 +27,14 @@
     },
     {
       "name": "wechat_send_image",
-      "description": "Send a picture to the person whose inbound message arrived most recently. Takes an absolute local file path; the file is uploaded to the WeChat CDN and delivered as a picture. A path whose content is not an image is delivered as a file instead, and the receipt says so. Optional caption is sent as a separate text message first.",
+      "description": "Send a picture to the person whose inbound message arrived most recently. Takes an absolute local file path inside the pet workspace (or the configured inbox); paths outside it are refused, so move a file into the workspace first. The file is uploaded to the WeChat CDN and delivered as a picture. A path whose content is not an image is delivered as a file instead, and the receipt says so. Optional caption is sent as a separate text message first.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "path": {
             "type": "string",
-            "description": "Absolute path of a local picture file."
+            "description": "Absolute path of a local picture file inside the workspace."
           },
           "caption": {
             "type": "string",
@@ -55,14 +55,14 @@
     },
     {
       "name": "wechat_send_file",
-      "description": "Send a file attachment to the person whose inbound message arrived most recently. Takes an absolute local file path; the file is uploaded to the WeChat CDN and delivered as a downloadable file. Video files are delivered as videos, not as attachments. Optional caption is sent as a separate text message first.",
+      "description": "Send a file attachment to the person whose inbound message arrived most recently. Takes an absolute local file path inside the pet workspace (or the configured inbox); paths outside it are refused, so move a file into the workspace first. The file is uploaded to the WeChat CDN and delivered as a downloadable file. Video files are delivered as videos, not as attachments. Optional caption is sent as a separate text message first.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "path": {
             "type": "string",
-            "description": "Absolute path of a local file."
+            "description": "Absolute path of a local file inside the workspace."
           },
           "caption": {
             "type": "string",
@@ -154,7 +154,7 @@
       "key": "worlds.wechat-claw.envPrompt",
       "title": "微信 ClawBot · 环境提示词",
       "role": "envPrompt",
-      "content": "微信 ClawBot 是一条一对一私聊通道，接在微信里，只能回复刚发消息的那个人。\n\n## 手边的状态\n\n{{wechat.state | (微信还没接上。)}}\n{{wechat.account | (还没有绑定的微信号。)}}\n{{wechat.lastMessageAt | (还没有收到过微信消息。)}}\n{{wechat.lastError | (最近没有连接错误。)}}\n\n## 什么时候用\n\n微信里来人说话时，会收到一条 `wechat-claw.message`，正文以 `[微信 时间 发送者]` 开头，媒体路径就写在里面。要回话就用 `wechat_send`；图片用 `wechat_send_image`，其他文件用 `wechat_send_file`，两者都接本机绝对路径。\n\n- 对方发来图片时，图片会作为附件一起到达，路径也写在正文里。看不到附件时，按路径自行读取。\n- 对方发来文件时，路径写在正文里，需要内容就按路径读。\n- 对方发来视频时，视频落盘、路径写在正文里；抽帧可用时按时间顺序附几张画面，正文会写明抽了几帧。正文说「视频帧未抽取」就是真的没看过，不要描述画面内容。\n- 对方发来语音时，正文里带服务端的转写文本；语音本身是 SILK 编码，一般不必再处理。没有转写文本时，你只知道时长，不知道说了什么。\n\n## 约束\n\n这条通道只能回复最近发消息的人，不能主动找人，也不能发到别处。`wechat_send` 的回执会写明发给了谁。\n\n一条文本最多 4000 字，超出的部分会自动接着发成下一条，不必自己切。断行位置优先落在段落和句号上。\n\n## 分段发送\n\n这一段决定你说话的样子，值得花心思。\n\n打开分段发送时，你写的东西会被拆成好几条微信消息，一条一条发出去，条与条之间会停顿，让对方看着像你还在打字。\n\n拆的顺序按一次算，不会拆两次：\n\n- 你写了换行，就只按换行拆；换行会消失，段内不再按标点拆。\n- 没写换行但有句号，就只按句号拆，句号会消失。\n- 都没写，但有 `！？…～`，就按它们拆；它们留着，因为你靠它们表达语气。\n- 都没有，就整条发出去。\n\n所以换行是你的节奏工具：**想让对方连看几行、想顿一下再说下一句，就写换行**。反过来，一句话里硬写换行会被拆成好几个气泡，看着像结巴。\n\n中文句号会被删掉，因为在微信里带句号显得生硬、像在写公文。这就是聊天里很少见句号的原因。别为了排版写句号。\n\n分段与间隔都是对方在配置页设的，你看不到也不必猜；照平时的习惯说话就行。\n\n对方的 `context_token` 会过期。回复被拒并提示没有可用 token 时，等对方再说一句再回，不要反复重试。\n\n这里发出的一切都会真的进到对方的微信里。不确定要不要发的时候，先问清楚。\n"
+      "content": "微信 ClawBot 是一条一对一私聊通道，接在微信里，只能回复刚发消息的那个人。\n\n## 手边的状态\n\n{{wechat.state | (微信还没接上。)}}\n{{wechat.account | (还没有绑定的微信号。)}}\n{{wechat.lastMessageAt | (还没有收到过微信消息。)}}\n{{wechat.lastError | (最近没有连接错误。)}}\n\n## 收到的东西在哪\n\n对方发来的图片、文件、视频、语音都落在你的工作区里：\n\n```\n{{wechat.inbox | (收件目录还没解析出来。)}}\n```\n\n它下面按类型分成 `images/`、`files/`、`videos/`、`voices/`，文件名保留对方给的原文名，后面接一个本地时间戳。\n这些文件就是普通文件——**读得到、改得了、也发得回去**。想让对方看到改过之后的版本，改完直接\n用 `wechat_send_file` 发那个路径就行。\n\n## 什么时候用\n\n微信里来人说话时，会收到一条 `wechat-claw.message`，正文以 `[微信 时间 发送者]` 开头，媒体路径就写在里面。要回话就用 `wechat_send`；图片用 `wechat_send_image`，其他文件用 `wechat_send_file`，两者都接本机绝对路径。\n\n- 对方发来图片时，图片会作为附件一起到达，路径也写在正文里。看不到附件时，按路径自行读取。\n  正文说「图片未附：体积…／尺寸…／超出数量上限」时，那张图是真的没交给你，**不要猜图里有什么**。\n- 对方发来文件时，路径写在正文里，需要内容就按路径读。\n- 对方发来视频时，视频落盘、路径写在正文里；抽帧可用时会把几帧**拼成一张图**附上，\n  正文写明布局（如「2列×2行，从左上到右下按时间顺序」）、原视频分辨率与每格尺寸。\n  按这个顺序理解画面；每格都很小，别去描述看不清的细节。正文说「视频帧未抽取」就是真的没看过。\n- 对方发来语音时，正文里带服务端的转写文本；语音本身是 SILK 编码，一般不必再处理。没有转写文本时，你只知道时长，不知道说了什么。\n\n## 能发什么\n\n只有你工作区里的文件能发到微信：\n\n```\n{{wechat.workspace | (工作区路径还没解析出来。)}}\n```\n\n收件目录在工作区里，所以收来的东西发得回去。工作区外面的路径会被直接拒绝——这不是故障，是边界：\n你的配置、密钥和这台机器的其他文件不在工作区的管辖范围内，不该被随手上传出去。\n\n要把工作区外的东西发出去，先把它复制进工作区（例如收件目录），再发复制之后那份。\n被拒绝时回执会列出允许的目录，照着调整路径就行，不要换个写法绕过它。\n\n## 约束\n\n这条通道只能回复最近发消息的人，不能主动找人，也不能发到别处。`wechat_send` 的回执会写明发给了谁。\n\n一条文本最多 4000 字，超出的部分会自动接着发成下一条，不必自己切。断行位置优先落在段落和句号上。\n\n## 分段发送\n\n这一段决定你说话的样子，值得花心思。\n\n打开分段发送时，你写的东西会被拆成好几条微信消息，一条一条发出去，条与条之间会停顿，让对方看着像你还在打字。\n\n拆的顺序按一次算，不会拆两次：\n\n- 你写了换行，就只按换行拆；换行会消失，段内不再按标点拆。紧挨换行的段尾句号也会被去掉，段内的句号留着。\n- 没写换行但有句号，就只按句号拆，句号会消失。\n- 都没写，但有 `！？…～`，就按它们拆；它们留着，因为你靠它们表达语气。\n- 都没有，就整条发出去。\n\n所以换行是你的节奏工具：**想让对方连看几行、想顿一下再说下一句，就写换行**。反过来，一句话里硬写换行会被拆成好几个气泡，看着像结巴。\n\n中文句号会被删掉，因为在微信里带句号显得生硬、像在写公文。这就是聊天里很少见句号的原因。别为了排版写句号。\n\n分段与间隔都是对方在配置页设的，你看不到也不必猜；照平时的习惯说话就行。\n\n对方的 `context_token` 会过期。回复被拒并提示没有可用 token 时，等对方再说一句再回，不要反复重试。\n\n这里发出的一切都会真的进到对方的微信里。不确定要不要发的时候，先问清楚。\n"
     }
   ]
 }

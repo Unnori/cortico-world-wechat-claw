@@ -103,6 +103,25 @@ function pickKind(text: string): 'newline' | 'stop' | 'soft' | null {
 }
 
 /**
+ * 去掉一段末尾的句号。
+ *
+ * 换行模式下，句号紧邻换行而落在段内（`说完了。\n接着讲`）。操作者要的是「句号也去掉」，
+ * 所以每段取完后剥掉尾部连续的 `。`／`．`／`.`。
+ *
+ * **只剥段尾**：`插件成熟度第一。文档齐全。` 里的第一个句号必须留着，否则句子粘在一起。
+ * ASCII `.` 在这里无条件剥——它已经在段尾，不可能是小数或域名的一部分。
+ */
+function trimStopTail(piece: string): string {
+  let out = piece;
+  while (out) {
+    const last = out[out.length - 1]!;
+    if (!HARD_STOPS.has(last) && last !== '.') break;
+    out = out.slice(0, -1);
+  }
+  return out.trimEnd();
+}
+
+/**
  * 按语义把 `text` 拆成若干段。
  *
  * 返回值已去掉分隔符、去掉首尾空白、丢弃空段。不含分隔符时返回单元素数组，
@@ -125,11 +144,15 @@ export function splitSegments(text: string): string[] {
 
   for (const cut of cuts) {
     // `keep` 为真时把分隔符留在前一段末尾（`！？…～` 的语气不能丢）。
-    const piece = source.slice(cursor, cut.keep ? cut.end : cut.start).trim();
+    let piece = source.slice(cursor, cut.keep ? cut.end : cut.start).trim();
+    // 换行模式下，紧邻换行的句号落在段尾，按操作者要求一并去掉。
+    if (kind === 'newline') piece = trimStopTail(piece);
     if (piece) parts.push(piece);
     cursor = cut.end;
   }
-  const tail = source.slice(cursor).trim();
+
+  let tail = source.slice(cursor).trim();
+  if (kind === 'newline') tail = trimStopTail(tail);
   if (tail) parts.push(tail);
 
   return parts;

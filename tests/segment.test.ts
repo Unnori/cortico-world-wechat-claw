@@ -9,23 +9,38 @@ import { describe, expect, it } from 'vitest';
 import { segmentDelayMs, segmentDelayOf, splitSegments } from '../src/segment.ts';
 
 describe('换行优先', () => {
-  it('有换行就只按换行拆，句号不参与', () => {
-    // 这正是「换行与句号同时出现」的情形：只拆一次，不额外拆句号。
+  it('有换行就只按换行拆，段内句号不参与分段', () => {
+    // 这正是「换行与句号同时出现」的情形：只拆一次，不额外按句号拆。
     const text = '俺给你分三层：\n插件成熟度第一。文档齐全。\nPython 那条路最舒服。';
     expect(splitSegments(text)).toEqual([
       '俺给你分三层：',
-      '插件成熟度第一。文档齐全。',
-      'Python 那条路最舒服。',
+      '插件成熟度第一。文档齐全',
+      'Python 那条路最舒服',
     ]);
   });
 
-  it('换行紧邻的句号留在段内，因为换行优先时段内不再拆', () => {
-    // 换行按一次算：句号跟着前一段走，不会被删也不会再拆一次。
-    expect(splitSegments('第一段。\n第二段。')).toEqual(['第一段。', '第二段。']);
+  it('换行前的句号被去掉（段内句号保留）', () => {
+    // 操作者的要求：换行与句号同时出现时，句号也要删。
+    // 「插件成熟度第一。文档齐全。」里的第一个句号在句子中间，必须留着。
+    const text = '俺给你分三层：\n插件成熟度第一。文档齐全。\nPython 那条路最舒服。';
+    expect(splitSegments(text)).toEqual([
+      '俺给你分三层：',
+      '插件成熟度第一。文档齐全',
+      'Python 那条路最舒服',
+    ]);
   });
 
-  it('换行前只有句号时，段尾就只剩句号，正常保留', () => {
-    expect(splitSegments('说完了。\n接着讲')).toEqual(['说完了。', '接着讲']);
+  it('段尾连续的句号一起清干净', () => {
+    expect(splitSegments('说完了。。\n接着讲')).toEqual(['说完了', '接着讲']);
+    expect(splitSegments('说完了.．。\n接着讲')).toEqual(['说完了', '接着讲']);
+  });
+
+  it('最后一段的段尾句号同样去掉', () => {
+    expect(splitSegments('甲。\n乙。')).toEqual(['甲', '乙']);
+  });
+
+  it('换行后紧跟句号时不会留下空段', () => {
+    expect(splitSegments('甲\n。\n乙')).toEqual(['甲', '乙']);
   });
 
   it('多个连续换行只算一次，不产生空段', () => {

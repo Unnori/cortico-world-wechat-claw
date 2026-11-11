@@ -1,13 +1,17 @@
-﻿/**
+/**
  * 入站消息的可读化、媒体落地与脱敏。
  *
  * `context_token` 是回复凭据，绝不进事件 meta、日志或模型上下文。
- * 媒体按类型下载解密后落到部署数据目录，路径写进事件正文，字节作为附件交给模型
- * （模型不支持该 MIME 时 Core 只发 `fallbackText`）。
+ * 媒体按类型下载解密后落到**桌宠工作区里的收件目录**（见 `paths.ts`），路径写进事件正文，
+ * 字节作为附件交给模型（模型不支持该 MIME 时 Core 只发 `fallbackText`）。
+ *
+ * 落盘位置与文件名都是给桌宠看的：目录按类型分，文件名保留对方给的原文名，
+ * 后面接一个本地时间戳。这样它读得到、改得了，也能原样发回去。
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { datedFileName, uniqueFileName } from '../paths.ts';
 import { extensionForInbound, imageSize, mimeFromFilename, sniffImageMime } from './mime.ts';
 import type { MediaTransfer } from './media.ts';
 import { MessageItemType, type MessageItem, type WeixinMessage } from './types.ts';
@@ -109,8 +113,8 @@ function voiceEncodingName(encodeType: number | undefined): string {
 
 export interface RenderOptions {
   media: MediaTransfer | null;
-  /** 媒体落盘目录，绝对路径。 */
-  mediaDir: string;
+  /** 收件目录，绝对路径。媒体按类型落到它下面的 images/files/videos/voices。 */
+  inboxDir: string;
   /** 每类媒体是否下载。关掉时只留占位文字。 */
   downloadImages: boolean;
   downloadFiles: boolean;
@@ -120,19 +124,30 @@ export interface RenderOptions {
   maxBytes: number;
 }
 
-/** 落盘并返回媒体描述；失败时返回一句说明，不抛错——一条消息不该因为附件失败整条丢掉。 */
+/**
+ * 落盘并返回文件路径；失败时抛错，由上层折成一句说明。
+ *
+ * 名字先按「原文名 + 时间戳」生成，撞名再退到 `-2`、`-3`；写入用 `wx` 独占标志，
+ * 万一在查重和写入之间被别人占了名字，就换一个再写，不覆盖已有文件。
+ */
 async function saveMedia(params: {
   bytes: Buffer;
-  mime: string;
-  ext: string;
   dir: string;
-  prefix: string;
+  name: string;
 }): Promise<string> {
   await mkdir(params.dir, { recursive: true });
-  const name = `${params.prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${params.ext}`;
-  const filePath = join(params.dir, name);
-  await writeFile(filePath, params.bytes);
-  return filePath;
+  let name = uniqueFileName(params.dir, params.name);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const filePath = join(params.dir, name);
+    try {
+      await writeFile(filePath, params.bytes, { flag: 'wx' });
+      return filePath;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+      name = uniqueFileName(params.dir, params.name);
+    }
+  }
+  throw new Error(`收件目录里放不下 ${params.name}`);
 }
 
 /** 取不到附件时给模型的一句话，按原因区分。 */
@@ -283,10 +298,8 @@ async function fetchItem(
       const mime = sniffImageMime(bytes) || 'image/jpeg';
       const path = await saveMedia({
         bytes,
-        mime,
-        ext: extensionForInbound(mime, bytes),
-        dir: join(opts.mediaDir, 'images'),
-        prefix: 'wx-image',
+        dir: join(opts.inboxDir, 'images'),
+        name: datedFileName(null, 'wx-image', extensionForInbound(mime, bytes)),
       });
       const size = imageSize(bytes);
       return {
@@ -311,10 +324,8 @@ async function fetchItem(
       const mime = mimeFromFilename(name || 'file.bin');
       const path = await saveMedia({
         bytes,
-        mime,
-        ext: extensionForInbound(mime, bytes),
-        dir: join(opts.mediaDir, 'files'),
-        prefix: 'wx-file',
+        dir: join(opts.inboxDir, 'files'),
+        name: datedFileName(name, 'wx-file', extensionForInbound(mime, bytes)),
       });
       return { ok: true, path, mime, bytes: bytes.length };
     }
@@ -330,10 +341,8 @@ async function fetchItem(
       });
       const path = await saveMedia({
         bytes,
-        mime: 'video/mp4',
-        ext: '.mp4',
-        dir: join(opts.mediaDir, 'videos'),
-        prefix: 'wx-video',
+        dir: join(opts.inboxDir, 'videos'),
+        name: datedFileName(null, 'wx-video', '.mp4'),
       });
       return { ok: true, path, mime: 'video/mp4', bytes: bytes.length };
     }
@@ -348,10 +357,8 @@ async function fetchItem(
     });
     const path = await saveMedia({
       bytes,
-      mime: 'audio/silk',
-      ext: '.silk',
-      dir: join(opts.mediaDir, 'voices'),
-      prefix: 'wx-voice',
+      dir: join(opts.inboxDir, 'voices'),
+      name: datedFileName(null, 'wx-voice', '.silk'),
     });
     return { ok: true, path, mime: 'audio/silk', bytes: bytes.length };
   } catch (err) {

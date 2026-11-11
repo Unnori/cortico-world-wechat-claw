@@ -33,6 +33,8 @@ export const WECHAT_CLAW: WorldDefinition<WechatClawConfigSection> = {
   defaults: () => ({ ...WECHAT_CLAW_DEFAULTS }),
   create: (ctx) => new WechatClawWorld({
     cfg: ctx.cfg,
+    // 工作区要从部署根推：`WorldContext` 不给 memoryDir，见 paths.ts。
+    botDir: ctx.botDir,
     dataDir: ctx.dataDir,
     timezone: ctx.timezone,
   }),

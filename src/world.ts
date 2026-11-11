@@ -7,9 +7,19 @@
  *
  * 这个通道的限制是平台给的：只能一对一，只能回复最近发消息的人，`context_token` 约 24 小时后失效。
  * 没有群聊、好友列表、朋友圈，也不能主动发起会话。
+ *
+ * ## 文件落在哪、能发什么
+ *
+ * 收来的媒体直接落进**桌宠工作区的收件目录**（`paths.ts`），不是插件自己的数据目录：
+ * 那里桌宠本来就伸得进去，于是「发给我看看」之后它能读、能改、还能发回来。
+ *
+ * 反过来，`wechat_send_image` / `wechat_send_file` 只接受**工作区（与收件目录、配置里额外
+ * 放行的目录）内**的路径。这条边界是安全设计的核心：插件自己的配置与凭据（`<dataDir>/wechat-claw/`
+ * 下的 `auth.json`、`context-tokens.json`）在工作区外面，所以即使模型被说服「把它自己的令牌发出去」，
+ * 也拿不到那些字节。
  */
 import { readFile, stat } from 'node:fs/promises';
-import { basename, isAbsolute } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import QRCode from 'qrcode';
@@ -38,9 +48,19 @@ import { UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/ty
 import { ILinkDriver } from './driver.ts';
 import { CredentialStore, type AuthRecord } from './store.ts';
 import { pickChannel, splitText } from './text.ts';
+import { fitImage, overCountNote, probeImage, type ImageLimits } from './media/imagefit.ts';
+import { MAX_FRAMES } from './media/layout.ts';
 import { segmentDelayMs, segmentDelayOf, splitSegments } from './segment.ts';
 import { ensureFfmpeg, installFfmpeg, installedSize, removeFfmpeg, type FfmpegResolution, type InstallProgress } from './media/ffmpeg.ts';
-import { extractFrames } from './media/frames.ts';
+import { extractFrameStrip } from './media/frames.ts';
+import {
+  checkSendable,
+  derivedDir,
+  ensureGitIgnored,
+  parseDirList,
+  resolveInboxDir,
+  resolveWorkspaceDir,
+} from './paths.ts';
 import {
   WECHAT_CLAW_CONFIG_GROUP,
   wechatClawText,
@@ -75,6 +95,13 @@ interface BindingState {
 export interface WechatClawWorldOptions {
   /** `worlds.wechat-claw` 的活引用。 */
   cfg: WechatClawConfigSection;
+  /**
+   * 部署根目录（`WorldContext.botDir`）。
+   *
+   * 收件目录要从这里推：`WorldContext` 不给 `memoryDir`，工作区只能按
+   * `config.json` 的 `paths.memory` 与目录存在性还原（见 `paths.ts`）。
+   */
+  botDir: string;
   dataDir: string;
   timezone: string;
   /**
@@ -107,14 +134,16 @@ export const WECHAT_CLAW_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     tags: ['speak'],
     description:
       'Send a picture to the person whose inbound message arrived most recently. '
-      + 'Takes an absolute local file path; the file is uploaded to the WeChat CDN and delivered as a picture. '
+      + 'Takes an absolute local file path inside the pet workspace (or the configured inbox); '
+      + 'paths outside it are refused, so move a file into the workspace first. '
+      + 'The file is uploaded to the WeChat CDN and delivered as a picture. '
       + 'A path whose content is not an image is delivered as a file instead, and the receipt says so. '
       + 'Optional caption is sent as a separate text message first.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Absolute path of a local picture file.' },
+        path: { type: 'string', description: 'Absolute path of a local picture file inside the workspace.' },
         caption: { type: 'string', description: 'Optional text sent before the picture.' },
       },
       required: ['path'],
@@ -125,14 +154,16 @@ export const WECHAT_CLAW_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     tags: ['speak'],
     description:
       'Send a file attachment to the person whose inbound message arrived most recently. '
-      + 'Takes an absolute local file path; the file is uploaded to the WeChat CDN and delivered as a downloadable file. '
+      + 'Takes an absolute local file path inside the pet workspace (or the configured inbox); '
+      + 'paths outside it are refused, so move a file into the workspace first. '
+      + 'The file is uploaded to the WeChat CDN and delivered as a downloadable file. '
       + 'Video files are delivered as videos, not as attachments. '
       + 'Optional caption is sent as a separate text message first.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Absolute path of a local file.' },
+        path: { type: 'string', description: 'Absolute path of a local file inside the workspace.' },
         caption: { type: 'string', description: 'Optional text sent before the file.' },
       },
       required: ['path'],
@@ -183,8 +214,13 @@ export class WechatClawWorld implements World {
   readonly id = ID;
 
   readonly #cfg: WechatClawConfigSection;
+  readonly #botDir: string;
   readonly #dataDir: string;
   readonly #timezone: string;
+  /** 桌宠工作区；收件目录与「能发什么」都相对它。 */
+  readonly #workspaceDir: string;
+  /** 收件目录；在建实例时解析一次，改配置要重启。 */
+  readonly #inboxDir: string;
   readonly #store: CredentialStore;
   readonly #apiBaseUrl: string = DEFAULT_BASE_URL;
   readonly #cdnBaseUrl: string = DEFAULT_CDN_BASE_URL;
@@ -218,8 +254,15 @@ export class WechatClawWorld implements World {
 
   constructor(opts: WechatClawWorldOptions) {
     this.#cfg = opts.cfg;
+    this.#botDir = opts.botDir;
     this.#dataDir = opts.dataDir;
     this.#timezone = opts.timezone;
+    // 解析一次就够：收件目录由配置与目录结构决定，改配置要重启（`inboxDir` 的 x-hot=false）。
+    this.#workspaceDir = resolveWorkspaceDir(opts.botDir);
+    this.#inboxDir = resolveInboxDir({
+      workspaceDir: this.#workspaceDir,
+      configured: opts.cfg.inboxDir,
+    });
     this.#store = new CredentialStore(`${opts.dataDir}/${ID}`);
     this.#apiBaseUrl = opts.endpoints?.apiBaseUrl ?? DEFAULT_BASE_URL;
     this.#cdnBaseUrl = opts.endpoints?.cdnBaseUrl ?? DEFAULT_CDN_BASE_URL;
@@ -244,6 +287,8 @@ export class WechatClawWorld implements World {
         ? clockText(Date.parse(this.#lastMessageAt), this.#timezone)
         : '',
       'wechat.lastError': this.#lastError,
+      'wechat.inbox': this.#inboxDir,
+      'wechat.workspace': this.#workspaceDir,
     };
   }
 
@@ -425,12 +470,29 @@ export class WechatClawWorld implements World {
    *
    * 视频按 MIME 走视频通道：`wechat_send_file` 拿到一个 .mp4 时，微信里应当显示成视频而不是附件。
    * 反过来 `wechat_send_image` 拿到非图片时按文件发，不让扩展名和通道对不上。
+   *
+   * **出去之前先过边界**：只有工作区（与收件目录、配置里额外放行的目录）里的文件能发。
+   * 检查返回的是规范化后的真实路径，后面 `stat`/`readFile` 都用它——检查的和读的是同一个对象。
    */
   async #toolSendMedia(args: Record<string, unknown>, requested: 'image' | 'file'): Promise<string> {
     const rawPath = String(args.path ?? '').trim();
     if (!rawPath) throw new Error('path 不能为空。');
     if (!isAbsolute(rawPath)) throw new Error(`path 必须是绝对路径：${rawPath}`);
-    const info = await stat(rawPath).catch(() => null);
+
+    const roots = this.#sendRoots();
+    const checked = checkSendable(rawPath, roots);
+    if (!checked.ok) {
+      if (checked.reason === 'missing') throw new Error(`找不到文件：${rawPath}`);
+      throw new Error(
+        `这个路径不在允许发送的范围里：${rawPath}\n`
+        + '能发出去的只有这些目录里的文件：\n'
+        + roots.map((root) => `- ${root}`).join('\n')
+        + `\n\n收来的文件都在 ${this.#inboxDir} 里；要发别处的文件，先把它复制进工作区。`,
+      );
+    }
+    const filePath = checked.path;
+
+    const info = await stat(filePath).catch(() => null);
     if (!info?.isFile()) throw new Error(`找不到文件：${rawPath}`);
     const maxBytes = Math.max(1, Number(this.#cfg.maxInboundMediaMb) || 20) * 1024 * 1024;
     if (info.size > maxBytes) {
@@ -441,7 +503,7 @@ export class WechatClawWorld implements World {
     const contextToken = await this.#requireContextToken(to);
     const api = this.#requireApi();
     const media = this.#requireMedia();
-    const bytes = await readFile(rawPath);
+    const bytes = await readFile(filePath);
 
     const caption = String(args.caption ?? '').trim();
     if (caption) {
@@ -451,7 +513,7 @@ export class WechatClawWorld implements World {
       }
     }
 
-    const mime = mimeFromFilename(rawPath);
+    const mime = mimeFromFilename(filePath);
     const channel = pickChannel(mime);
     const uploaded = await media.upload({
       bytes,
@@ -464,7 +526,7 @@ export class WechatClawWorld implements World {
       ? imageMessage({ to, uploaded, contextToken })
       : channel === 'video'
         ? videoMessage({ to, uploaded, contextToken })
-        : fileMessage({ to, fileName: basename(rawPath), uploaded, contextToken });
+        : fileMessage({ to, fileName: basename(filePath), uploaded, contextToken });
     const response = await api.sendMessage(message);
 
     this.#host?.log?.info?.('微信已发送媒体', {
@@ -477,8 +539,19 @@ export class WechatClawWorld implements World {
     const what = channel === 'image' ? '图片' : channel === 'video' ? '视频' : '文件';
     // 工具点名与实际通道不一致时说清楚，免得模型以为发了图片其实发的是附件。
     const note = requested !== channel ? `（按文件类型走的是${what}通道）` : '';
-    return `已把${what}「${basename(rawPath)}」发到微信（${shortId(to)}）${note}`
+    return `已把${what}「${basename(filePath)}」发到微信（${shortId(to)}）${note}`
       + `${response?.message_id ? `，消息 #${response.message_id}` : ''}。`;
+  }
+
+  /**
+   * 允许发到微信的目录：工作区、收件目录，加上配置里额外放行的。
+   *
+   * 每次都现算：`sendExtraDirs` 是热生效的，改完不必重启。
+   */
+  #sendRoots(): string[] {
+    const roots = [this.#workspaceDir, this.#inboxDir];
+    for (const dir of parseDirList(this.#cfg.sendExtraDirs, this.#botDir)) roots.push(dir);
+    return [...new Set(roots.filter(Boolean))];
   }
 
   #toolStatus(): string {
@@ -495,6 +568,9 @@ export class WechatClawWorld implements World {
       lastError: state.lastError,
       contextTokens: state.contextTokens,
       startedAt: state.startedAt,
+      workspace: this.#workspaceDir,
+      inbox: this.#inboxDir,
+      sendRoots: this.#sendRoots(),
     }, null, 2);
   }
 
@@ -1032,6 +1108,8 @@ export class WechatClawWorld implements World {
           { name: 'wechat.account', description: '绑定的微信用户。' },
           { name: 'wechat.lastMessageAt', description: '最近一条入站消息的时间。' },
           { name: 'wechat.lastError', description: '最近一次连接错误。' },
+          { name: 'wechat.inbox', description: '收件目录的绝对路径（收到的图片、文件、视频、语音都在这里）。' },
+          { name: 'wechat.workspace', description: '桌宠工作区的绝对路径；能发到微信的文件只在这个范围内。' },
         ],
       }],
     };
@@ -1043,6 +1121,12 @@ export class WechatClawWorld implements World {
     if (this.#started) return;
     this.#host = host;
     this.#startedAt = nowIso(this.#timezone);
+
+    host.log.info(`微信收件目录：${this.#inboxDir}（工作区 ${this.#workspaceDir}）`);
+    // Coo 的工作区是 Git 仓库，每次写文件都 `git add -A`；收到的视频不该进版本历史。
+    if (ensureGitIgnored(this.#workspaceDir, this.#inboxDir)) {
+      host.log.info(`已把收件目录写进工作区的 .gitignore：${this.#inboxDir}`);
+    }
 
     this.#route = createNetworkRoute({
       mode: this.#cfg.networkMode,
@@ -1299,7 +1383,7 @@ export class WechatClawWorld implements World {
     const maxBytes = Math.max(1, Number(this.#cfg.maxInboundMediaMb) || 20) * 1024 * 1024;
     const rendered = await renderInbound(message, {
       media: this.#media,
-      mediaDir: `${this.#dataDir}/${ID}/inbox`,
+      inboxDir: this.#inboxDir,
       downloadImages: this.#cfg.receiveImages !== false,
       downloadFiles: this.#cfg.receiveFiles !== false,
       downloadVoice: this.#cfg.receiveVoices !== false,
@@ -1313,11 +1397,21 @@ export class WechatClawWorld implements World {
     // 语音只按模型实际支持的 MIME 附；不支持音频就别把 SILK 字节塞进去。
     const acceptsAudio = host?.modelFacts?.accepts?.('audio/silk') ?? false;
     const videoNotes: string[] = [];
+    // 闸门里要写进正文的说明（压缩了哪张、哪张被丢掉、为什么）。
+    const fitNotes: string[] = [];
+    // 一次投递累计附了几张图，用来卡上限。
+    let imageCount = 0;
+    const limits = this.#imageLimits();
 
     for (const item of rendered.media) {
       if (item.kind === 'image') {
         if (!acceptsImages) continue;
-        await this.#addBlob(blobs, item.path, item.mime, item.label);
+        imageCount += 1;
+        if (imageCount > limits.maxCount) {
+          fitNotes.push(`[图片未附：${overCountNote(imageCount - 1, limits)}]`);
+          continue;
+        }
+        await this.#attachImage(blobs, item, limits, fitNotes);
         continue;
       }
       if (item.kind === 'voice') {
@@ -1326,7 +1420,10 @@ export class WechatClawWorld implements World {
         continue;
       }
       if (item.kind === 'video') {
-        const note = await this.#attachFrames(blobs, item.path, acceptsImages);
+        const note = await this.#attachFrames(blobs, item.path, acceptsImages, limits, fitNotes, (n) => {
+          imageCount += n;
+          return imageCount;
+        });
         if (note) videoNotes.push(note);
       }
     }
@@ -1367,11 +1464,80 @@ export class WechatClawWorld implements World {
     }
   }
 
+  /** 图片闸门的三个上限，从配置里取，带兜底值。 */
+  #imageLimits(): ImageLimits {
+    const mb = Number(this.#cfg.imageMaxMb);
+    const edge = Number(this.#cfg.imageMaxEdge);
+    const count = Number(this.#cfg.imageMaxCount);
+    return {
+      maxBytes: Math.max(1, Number.isFinite(mb) ? mb : 16) * 1024 * 1024,
+      maxEdge: Math.max(256, Number.isFinite(edge) ? edge : 4096),
+      maxCount: Math.max(1, Math.floor(Number.isFinite(count) ? count : 10)),
+    };
+  }
+
+  /** 图片闸门的产物放哪；放在收件目录的派生层里，不和原件混在一起。 */
+  #fitDir(): string {
+    return derivedDir(this.#inboxDir, 'fitted');
+  }
+
   /**
-   * 抽帧并作为图片附件加入。返回一句要写进正文的说明；抽到了也返回说明，
-   * 让模型知道这些图来自视频、以及时间位置。
+   * 附一张图片，超限的先压缩；压不了就不附，并在正文里写明哪一项超标。
+   *
+   * 先看元数据再决定读不读内容：32 MB 的图不该先整读进内存再判断。
    */
-  async #attachFrames(blobs: BlobInput[], videoPath: string, acceptsImages: boolean): Promise<string> {
+  async #attachImage(
+    blobs: BlobInput[],
+    item: { path: string; mime: string; label: string; bytes?: number },
+    limits: ImageLimits,
+    notes: string[],
+  ): Promise<void> {
+    const probe = await probeImage(item.path, item.mime);
+    if (!probe) {
+      notes.push(`[${item.label} 未附：文件读不出来]`);
+      return;
+    }
+
+    const fitted = await fitImage({
+      probe,
+      limits,
+      ffmpegPath: this.#ffmpeg?.path ?? null,
+      outDir: this.#fitDir(),
+    });
+
+    if (!fitted.ok) {
+      notes.push(`[${item.label} 未附：${fitted.reason}]`);
+      return;
+    }
+    if (fitted.note) notes.push(`[${item.label} ${fitted.note}]`);
+
+    try {
+      const bytes = await readFile(fitted.path);
+      blobs.push({
+        bytes: new Uint8Array(bytes),
+        mime: fitted.mime,
+        name: basename(fitted.path),
+        fallbackText: item.label,
+      });
+    } catch {
+      notes.push(`[${item.label} 未附：附件读不出来]`);
+    }
+  }
+
+  /**
+   * 抽帧并拼成一张图附上。
+   *
+   * 拼图也算一张图片，要走同一个数量额度。
+   * 抽不出来时返回一句写进正文的说明——**不假装看过视频**。
+   */
+  async #attachFrames(
+    blobs: BlobInput[],
+    videoPath: string,
+    acceptsImages: boolean,
+    limits: ImageLimits,
+    notes: string[],
+    bumpCount: (n: number) => number,
+  ): Promise<string> {
     const wanted = Math.floor(Number(this.#cfg.videoFrames) ?? 0);
     if (!(wanted > 0)) return '';
     if (!acceptsImages) return '[视频帧未提供：当前模型不接受图片输入]';
@@ -1381,20 +1547,51 @@ export class WechatClawWorld implements World {
       return `[视频帧未抽取：${this.#ffmpeg?.detail || '没有可用的 ffmpeg'}]`;
     }
 
-    const result = await extractFrames({
+    // 拼图也占一张图片额度；满了就别抽了，省得白跑一趟 ffmpeg。
+    if (bumpCount(1) > limits.maxCount) {
+      notes.push('[视频拼图未附：超出本次投递的图片数量上限]');
+      return '';
+    }
+
+    const result = await extractFrameStrip({
       ffmpegPath,
       videoPath,
-      outDir: `${this.#dataDir}/${ID}/inbox/frames/${Date.now().toString(36)}`,
-      count: wanted,
-      maxEdge: Number(this.#cfg.videoFrameMaxEdge) || 640,
+      outDir: derivedDir(this.#inboxDir, 'frames', Date.now().toString(36)),
+      frames: Math.min(MAX_FRAMES, wanted),
     });
-    if (!result.frames.length) {
-      return `[视频帧未抽取：${result.reason || 'ffmpeg 没有产出帧'}]`;
+
+    if (!result.ok) return `[视频帧未抽取：${result.reason}]`;
+
+    const { strip } = result;
+    // 拼图本身也要过闸门：帧数多、分辨率高时可能超边或超体积。
+    const fitted = await fitImage({
+      probe: { path: strip.path, bytes: strip.bytes, mime: strip.mime },
+      limits,
+      ffmpegPath,
+      outDir: this.#fitDir(),
+    });
+    if (!fitted.ok) {
+      notes.push(`[视频拼图未附：${fitted.reason}]`);
+      return '';
     }
-    for (const [index, frame] of result.frames.entries()) {
-      await this.#addBlob(blobs, frame.path, 'image/jpeg', `[视频第 ${index + 1} 帧]`);
+    if (fitted.note) notes.push(`[视频拼图 ${fitted.note}]`);
+
+    try {
+      const bytes = await readFile(fitted.path);
+      blobs.push({
+        bytes: new Uint8Array(bytes),
+        mime: fitted.mime,
+        name: basename(fitted.path),
+        fallbackText: '视频拼图',
+      });
+    } catch {
+      return '[视频帧未抽取：拼图读不出来]';
     }
-    return `[视频帧：已抽取 ${result.frames.length} 帧，按时间顺序附在本条消息里]`;
+
+    const sizeNote = strip.videoSize
+      ? `原视频 ${strip.videoSize.width}×${strip.videoSize.height}，`
+      : '原视频方向未识别，按横屏处理，';
+    return `[视频拼图：${sizeNote}${result.note}]`;
   }
 
   async #signalTyping(userId: string, contextToken: string): Promise<void> {
@@ -1464,4 +1661,3 @@ function nullLoggerShim(): Logger {
   };
   return logger;
 }
-
