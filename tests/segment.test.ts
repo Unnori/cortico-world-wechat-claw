@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { segmentDelayMs, segmentDelayOf, splitSegments } from '../src/segment.ts';
+import { segmentDelayMs, splitSegments } from '../src/segment.ts';
 
 describe('换行优先', () => {
   it('有换行就只按换行拆，段内句号不参与分段', () => {
@@ -120,37 +120,28 @@ describe('真实长文本', () => {
   });
 });
 
-describe('延时口径', () => {
-  it('固定间隔直接换算成毫秒', () => {
-    expect(segmentDelayMs({ mode: 'fixed', seconds: 2 }, 0)).toBe(2000);
-    expect(segmentDelayMs({ mode: 'fixed', seconds: 0 }, 3)).toBe(0);
+describe('按字数停顿', () => {
+  it('短句和特长段立即发送，边界按 Unicode 字符计数', () => {
+    for (const text of ['', '字'.repeat(20), '🐟'.repeat(20), '字'.repeat(301)]) {
+      expect(segmentDelayMs(text)).toBe(0);
+    }
+    expect(segmentDelayMs('🐟'.repeat(21))).toBeGreaterThan(0);
   });
 
-  it('随机区间落在上下界之间', () => {
-    const delay = { mode: 'random' as const, min: 1, max: 4 };
-    expect(segmentDelayMs(delay, 0, () => 0)).toBe(1000);
-    expect(segmentDelayMs(delay, 0, () => 1)).toBe(4000);
-    expect(segmentDelayMs(delay, 0, () => 0.5)).toBe(2500);
+  it('中等长度稍等，长句等待更多，各档由同一个聊天节奏控制', () => {
+    const medium = segmentDelayMs('字'.repeat(21));
+    expect(segmentDelayMs('字'.repeat(80))).toBe(medium);
+    const long = segmentDelayMs('字'.repeat(81));
+    expect(long).toBeGreaterThan(medium);
+    expect(segmentDelayMs('字'.repeat(300))).toBe(long);
+    expect(segmentDelayMs('字'.repeat(81), 2)).toBe(long * 2);
+    expect(segmentDelayMs('字'.repeat(81), 0)).toBe(0);
   });
 
-  it('随机上下界写反了自动换过来', () => {
-    expect(segmentDelayMs({ mode: 'random', min: 5, max: 2 }, 0, () => 0)).toBe(2000);
-    expect(segmentDelayMs({ mode: 'random', min: 5, max: 2 }, 0, () => 1)).toBe(5000);
-  });
-
-  it('负数与 NaN 归零，不会算出负等待', () => {
-    expect(segmentDelayMs({ mode: 'fixed', seconds: -1 }, 0)).toBe(0);
-    expect(segmentDelayMs({ mode: 'random', min: -2, max: -1 }, 0, () => 0.5)).toBe(0);
-  });
-
-  it('从配置段取口径，负数当 0', () => {
-    expect(segmentDelayOf({ segmentDelayMode: 'fixed', segmentDelayFixedSec: 3 }))
-      .toEqual({ mode: 'fixed', seconds: 3 });
-    expect(segmentDelayOf({ segmentDelayMode: 'random', segmentDelayMinSec: 1, segmentDelayMaxSec: 5 }))
-      .toEqual({ mode: 'random', min: 1, max: 5 });
-    expect(segmentDelayOf({ segmentDelayMode: 'fixed', segmentDelayFixedSec: -4 }))
-      .toEqual({ mode: 'fixed', seconds: 0 });
-    // 没写模式时按固定处理。
-    expect(segmentDelayOf({})).toEqual({ mode: 'fixed', seconds: 0 });
+  it('无效配置采用默认节奏，负值不等待，过大值限制在面板上限', () => {
+    const text = '字'.repeat(50);
+    expect(segmentDelayMs(text, NaN)).toBe(segmentDelayMs(text));
+    expect(segmentDelayMs(text, -1)).toBe(0);
+    expect(segmentDelayMs(text, 100)).toBe(segmentDelayMs(text, 10));
   });
 });

@@ -46,7 +46,7 @@ export interface DriverOptions {
   api: ILinkApi;
   store: CredentialStore;
   log: Logger;
-  onMessage: (message: WeixinMessage) => void | Promise<void>;
+  onMessage: (message: WeixinMessage, receivedAtMs: number) => void | Promise<void>;
   onStatus: (status: DriverStatus) => void;
   pollTimeoutMs?: number;
   reconnectBaseMs?: number;
@@ -140,6 +140,7 @@ export class ILinkDriver {
           signal: controller.signal,
         });
         if (this.#stopped) return;
+        const receivedAtMs = Date.now();
 
         const errcode = Number(response?.errcode ?? 0);
         const ret = Number(response?.ret ?? 0);
@@ -198,7 +199,7 @@ export class ILinkDriver {
         for (const message of messages) {
           if (this.#stopped) break;
           try {
-            await this.#onMessage(message);
+            await this.#onMessage(message, receivedAtMs);
           } catch (err) {
             this.#log.warn('入站消息处理失败', { error: errorText(err) });
           }

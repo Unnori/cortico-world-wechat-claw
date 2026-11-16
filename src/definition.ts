@@ -44,8 +44,8 @@ export const WECHAT_CLAW: WorldDefinition<WechatClawConfigSection> = {
       {
         type: EVENT_MESSAGE,
         description: {
-          zh: '一条微信私聊消息；正文是一行可读文本，媒体路径写在正文里，图片与语音作为附件随事件到达。',
-          en: 'A WeChat 1:1 message; the text is one readable line, media paths are inline, and pictures or voices arrive as attachments.',
+          zh: '一条微信私聊消息；媒体路径写在正文里，Provider 支持的图片、音频、视频和文件作为附件到达。不支持原生视频时尝试抽帧，附件未提供的原因写在正文里。',
+          en: 'A WeChat 1:1 message with local media paths. Images, audio, video and files arrive as attachments when accepted by the Provider. Video falls back to frames; unavailable attachments include a reason.',
         },
         trigger: 'debounce',
       },

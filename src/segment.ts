@@ -158,51 +158,11 @@ export function splitSegments(text: string): string[] {
   return parts;
 }
 
-/** 分段延时的两种口径。 */
-export type SegmentDelay = { mode: 'fixed'; seconds: number } | { mode: 'random'; min: number; max: number };
-
-/**
- * 从配置段里取出延时口径。
- *
- * 数值容错：负数归零、`NaN` 归零；随机区间写反了由 `segmentDelayMs` 换回来。
- */
-export function segmentDelayOf(cfg: {
-  segmentDelayMode?: string;
-  segmentDelayFixedSec?: number;
-  segmentDelayMinSec?: number;
-  segmentDelayMaxSec?: number;
-}): SegmentDelay {
-  if (cfg.segmentDelayMode === 'random') {
-    return {
-      mode: 'random',
-      min: numOr0(cfg.segmentDelayMinSec),
-      max: numOr0(cfg.segmentDelayMaxSec),
-    };
-  }
-  return { mode: 'fixed', seconds: numOr0(cfg.segmentDelayFixedSec) };
-}
-
-const numOr0 = (value: unknown): number => {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-};
-
-/**
- * 算第 `index` 段发完之后该等多久（毫秒）。
- *
- * `index` 从 0 开始；最后一段之后不需要等待，调用方自己判断。
- * 这里只做**纯计算**，不 sleep，方便测试与调用方控制总时长。
- *
- * 随机口径用 `random` 注入，默认 `Math.random`。
- */
-export function segmentDelayMs(delay: SegmentDelay, index: number, random: () => number = Math.random): number {
-  void index;
-  if (delay.mode === 'fixed') {
-    return Math.max(0, Math.round(delay.seconds * 1000));
-  }
-  const lo = Math.min(delay.min, delay.max);
-  const hi = Math.max(delay.min, delay.max);
-  const span = Math.max(0, hi - lo);
-  const pick = lo + span * Math.min(Math.max(random(), 0), 1);
-  return Math.max(0, Math.round(pick * 1000));
+/** 每条消息发送前的停顿；特长段视作未能断句，直接发送。 */
+export function segmentDelayMs(text: string, pace = 1): number {
+  const length = Array.from(text).length;
+  const value = Number(pace);
+  const scale = Number.isFinite(value) ? Math.min(10, Math.max(0, value)) : 1;
+  if (length <= 20 || length > 300) return 0;
+  return Math.round((length <= 80 ? 600 : 1400) * scale);
 }

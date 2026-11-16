@@ -60,15 +60,9 @@ export interface WechatClawConfigSection {
    * 中文句号删掉（社交软件里带句号显得生硬），情绪标点保留。
    */
   segmentEnabled: boolean;
-  /** 段间等待口径：固定间隔，或在区间内随机。 */
-  segmentDelayMode: 'fixed' | 'random';
-  /** 固定间隔，秒。 */
-  segmentDelayFixedSec: number;
-  /** 随机间隔下限，秒。 */
-  segmentDelayMinSec: number;
-  /** 随机间隔上限，秒。 */
-  segmentDelayMaxSec: number;
-  /** 单次回复最多拆几条；超出就把剩下的合并进最后一条。 */
+  /** 按字数计算等待时长的倍率；0 表示不等待。 */
+  segmentPace: number;
+  /** 语义段数达到此值就取消语义分段，仍遵守单条字数上限；0 表示不限。 */
   segmentMaxParts: number;
   /** 一次发送累计等待上限，秒；到点就把剩下的一起发完。 */
   segmentMaxTotalSec: number;
@@ -93,10 +87,7 @@ export const WECHAT_CLAW_DEFAULTS: WechatClawConfigSection = {
   imageMaxCount: 10,
   ffmpegProxyUrl: '',
   segmentEnabled: true,
-  segmentDelayMode: 'fixed',
-  segmentDelayFixedSec: 2,
-  segmentDelayMinSec: 1,
-  segmentDelayMaxSec: 4,
+  segmentPace: 1,
   segmentMaxParts: 12,
   segmentMaxTotalSec: 30,
 };
@@ -246,43 +237,30 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
           + '中文句号会删掉（社交软件里带句号显得生硬），！？…～ 保留语气。修改后需重启。',
         'x-hot': false,
       },
-      'worlds.wechat-claw.segmentDelayMode': {
-        type: 'string',
-        title: '间隔方式',
-        description: '固定间隔，或在区间内随机取值。只在「分段发送」打开时有效。',
-        enum: ['fixed', 'random'],
-        'x-hot': true,
-      },
-      'worlds.wechat-claw.segmentDelayFixedSec': {
+      'worlds.wechat-claw.segmentPace': {
         type: 'number',
-        title: '固定间隔（秒）',
-        description: '每一段发完后等这么久。0 表示连着发完。',
-        'x-hot': true,
-      },
-      'worlds.wechat-claw.segmentDelayMinSec': {
-        type: 'number',
-        title: '随机下限（秒）',
-        description: '随机间隔的下界。和上限写反了会自动换过来。',
-        'x-hot': true,
-      },
-      'worlds.wechat-claw.segmentDelayMaxSec': {
-        type: 'number',
-        title: '随机上限（秒）',
-        description: '随机间隔的上界。',
+        title: '聊天节奏',
+        description: '按每条消息的字数决定发送前的停顿。1 为默认，越大越慢，0 不等待。'
+          + '20 字以内立即发送；21～80 字稍作停顿；81～300 字停顿更久；超过 300 字直接发送。'
+          + '达到分段阈值或关闭分段时直接发送。',
+        minimum: 0,
+        maximum: 10,
+        multipleOf: 0.1,
         'x-hot': true,
       },
       'worlds.wechat-claw.segmentMaxParts': {
         type: 'number',
-        title: '最多拆几段',
+        title: '分段阈值',
         description:
-          '单次回复的上限。超出时把多出来的内容并进最后一段，避免模型输出几十行把这次发送拖很久。',
+          '语义段数达到这个值就取消分段，直接发送完整原文；超过微信单条 4000 字时仍按字数分条。0 表示不限。',
+        minimum: 0,
         'x-hot': true,
       },
       'worlds.wechat-claw.segmentMaxTotalSec': {
         type: 'number',
         title: '总等待上限（秒）',
         description:
-          '一次发送里所有间隔加起来的上限。到点就把剩下的一起发完，回执会写明有截断。',
+          '一次发送里所有停顿加起来的上限。到点不再等待，剩下的消息照常发完。0 表示不限。',
         'x-hot': true,
       },
     },

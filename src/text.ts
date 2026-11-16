@@ -12,7 +12,7 @@ const SENTENCE_END = /[。！？；…!?;\n]/;
  * 把 `text` 切成每段不超过 `limit` 的若干段。
  * 不超限时原样返回单元素数组，调用方不必区分两种情况。
  */
-export function splitText(text: string, limit: number): string[] {
+export function splitText(text: string, limit: number, preserveWhitespace = false): string[] {
   const max = Math.max(1, Math.floor(limit));
   if (text.length <= max) return [text];
 
@@ -35,9 +35,9 @@ export function splitText(text: string, limit: number): string[] {
     // 都不合适就硬切，但别切在代理对中间。
     if (cut < max * 0.3) cut = safeCut(rest, max);
 
-    const piece = rest.slice(0, cut).trimEnd();
+    const piece = preserveWhitespace ? rest.slice(0, cut) : rest.slice(0, cut).trimEnd();
     if (piece) parts.push(piece);
-    rest = rest.slice(cut).trimStart();
+    rest = preserveWhitespace ? rest.slice(cut) : rest.slice(cut).trimStart();
   }
   if (rest) parts.push(rest);
   return parts.length ? parts : [text];

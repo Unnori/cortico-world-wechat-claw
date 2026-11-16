@@ -111,6 +111,19 @@ function voiceEncodingName(encodeType: number | undefined): string {
   }
 }
 
+function voiceMime(encodeType: number | undefined): string {
+  switch (Number(encodeType ?? 6)) {
+    case 1: return 'audio/pcm';
+    case 2: return 'audio/adpcm';
+    case 4: return 'audio/speex';
+    case 5: return 'audio/amr';
+    case 6: return 'audio/silk';
+    case 7: return 'audio/mpeg';
+    case 8: return 'audio/ogg';
+    default: return 'application/octet-stream';
+  }
+}
+
 export interface RenderOptions {
   media: MediaTransfer | null;
   /** 收件目录，绝对路径。媒体按类型落到它下面的 images/files/videos/voices。 */
@@ -355,12 +368,13 @@ async function fetchItem(
       aesKeyBase64: ref.aes_key,
       maxBytes: opts.maxBytes,
     });
+    const mime = voiceMime(voice?.encode_type);
     const path = await saveMedia({
       bytes,
       dir: join(opts.inboxDir, 'voices'),
-      name: datedFileName(null, 'wx-voice', '.silk'),
+      name: datedFileName(null, 'wx-voice', extensionForInbound(mime, bytes)),
     });
-    return { ok: true, path, mime: 'audio/silk', bytes: bytes.length };
+    return { ok: true, path, mime, bytes: bytes.length };
   } catch (err) {
     // 超限与取回失败要分开：前者是配置决定的，后者是网络或服务端问题。
     const tooLarge = err instanceof Error && /超过上限/.test(err.message);

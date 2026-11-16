@@ -112,12 +112,23 @@ export class CredentialStore {
     return Object.keys(await this.loadContextTokens()).length;
   }
 
+  async loadLastMessageAt(userId: string): Promise<string> {
+    const data = await this.#readJson<{ userId: string; lastMessageAt: string }>('status.json');
+    const ms = Date.parse(data?.lastMessageAt ?? '');
+    return data?.userId === userId && Number.isFinite(ms) ? new Date(ms).toISOString() : '';
+  }
+
+  async saveLastMessageAt(userId: string, lastMessageAt: string): Promise<void> {
+    await this.#writeJson('status.json', { userId, lastMessageAt });
+  }
+
   /** 会话过期时清掉全部凭据，让用户重新扫码。 */
   async clearSession(): Promise<void> {
     await Promise.all([
       rm(this.#path('auth.json'), { force: true }),
       rm(this.#path('context-tokens.json'), { force: true }),
       rm(this.#path('sync.json'), { force: true }),
+      rm(this.#path('status.json'), { force: true }),
     ]);
   }
 }

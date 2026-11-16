@@ -21,6 +21,7 @@ import { encryptForTest, startFakeServer, type FakeServer } from './helpers/fake
 class FakeHost implements WorldHost {
   events: EventEnvelope[] = [];
   acceptImages = true;
+  acceptedMimes = new Set<string>();
   log = nullLogger();
 
   async pushEvent(
@@ -50,7 +51,7 @@ class FakeHost implements WorldHost {
 
   modelFacts = {
     model: () => 'test-model',
-    accepts: (mime: string) => (mime.startsWith('image/') ? this.acceptImages : false),
+    accepts: (mime: string) => this.acceptedMimes.has(mime) || (mime.startsWith('image/') && this.acceptImages),
     contextWindow: () => 128000,
   };
 
@@ -142,6 +143,25 @@ describe('定义与声明', () => {
     for (const match of template.matchAll(/\{\{\s*([\w.]+)\s*(\|[^}]*)?\}\}/g)) {
       expect(match[2], `${match[1]} 缺少 | 缺省文案`).toBeTruthy();
     }
+  });
+
+  it('旧版没有状态文件时从当前绑定用户的归档消息恢复时间', async () => {
+    const srv = await startFakeServer();
+    server = srv;
+    const authDir = join(scratchDir, 'wechat-claw');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(join(authDir, 'auth.json'), JSON.stringify({
+      token: 'bot-token-123', baseUrl: srv.baseUrl, accountId: 'bot-account@im.bot', userId: 'wx-user@im.wechat',
+    }));
+    const host = new FakeHost();
+    host.store.range = (query) => {
+      expect(query.senderKey).toBe('wx-user@im.wechat');
+      return [{ type: EVENT_MESSAGE, ts: '2026-11-16T08:37:00.000Z' }] as EventEnvelope[];
+    };
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    await world.start(host);
+    try { expect(world.webUi('zh').badges?.[1]).toMatchObject({ value: '11/16 16:37', tone: 'on' }); }
+    finally { await world.stop(); }
   });
 });
 
@@ -239,6 +259,10 @@ describe('入站消息', () => {
     const raw = JSON.stringify(event.meta?.raw ?? {});
     expect(raw).not.toContain('ctx-2');
     expect(event.meta?.kind).toBe('message/private');
+    expect(event.meta?.timing).toMatchObject({
+      receivedAt: expect.any(String), receiveDelayMs: expect.any(Number),
+      queueMs: expect.any(Number), processingMs: expect.any(Number),
+    });
     await world.stop();
   });
 
@@ -518,7 +542,14 @@ describe('入站消息', () => {
     expect(local).toContain('05:11');
     expect(local).not.toContain('21:11');
     expect(local.startsWith('2026-10-28')).toBe(true);
+    expect(world.webUi('zh').badges?.[1]).toMatchObject({ value: '10/28 05:11', tone: 'on' });
     await world.stop();
+
+    // 重启后的新实例也应当保留最后消息时间。
+    const restarted = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    await restarted.start(new FakeHost());
+    expect(restarted.webUi('zh').badges?.[1]).toMatchObject({ value: '10/28 05:11', tone: 'on' });
+    await restarted.stop();
   });
   it('没有 ffmpeg 时，视频消息写明未抽帧而不是假装看过', async () => {
     const srv = await startFakeServer();
@@ -639,39 +670,43 @@ describe('分段发送', () => {
     srv.sent.map((msg) => String((msg.item_list as Array<{ text_item?: { text?: string } }>)[0]?.text_item?.text ?? ''));
 
   it('按换行拆成多条发送，每条内容正确', async () => {
-    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    const { srv, world, send } = await ready({ segmentPace: 0 });
     await send.handler({ text: '甲\n乙\n丙' }, call);
     expect(texts(srv)).toEqual(['甲', '乙', '丙']);
     await world.stop();
   });
 
   it('没有换行时按句号拆，且句号被删掉', async () => {
-    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    const { srv, world, send } = await ready({ segmentPace: 0 });
     await send.handler({ text: '今天下雨了。我带了伞。' }, call);
     expect(texts(srv)).toEqual(['今天下雨了', '我带了伞']);
     await world.stop();
   });
 
   it('情绪标点只拆不删，标点跟着前一段', async () => {
-    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    const { srv, world, send } = await ready({ segmentPace: 0 });
     await send.handler({ text: '真的假的？太好了！' }, call);
     expect(texts(srv)).toEqual(['真的假的？', '太好了！']);
     await world.stop();
   });
 
-  it('固定间隔真的会等', async () => {
-    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0.3 });
+  it('中等长度在发送前按聊天节奏停顿', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 0.5 });
+    const text = '甲'.repeat(30);
     const started = Date.now();
-    const receipt = String(await send.handler({ text: '甲\n乙' }, call));
+    const sending = send.handler({ text }, call);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(texts(srv)).toEqual([]);
+    const receipt = String(await sending);
     const elapsed = Date.now() - started;
     expect(elapsed).toBeGreaterThanOrEqual(250);
     expect(receipt).toContain('共等待');
-    expect(texts(srv)).toEqual(['甲', '乙']);
+    expect(texts(srv)).toEqual([text]);
     await world.stop();
   });
 
   it('关掉分段就恢复成一条发完、不等', async () => {
-    const { srv, world, send } = await ready({ segmentEnabled: false, segmentDelayFixedSec: 5 });
+    const { srv, world, send } = await ready({ segmentEnabled: false, segmentPace: 5 });
     const started = Date.now();
     await send.handler({ text: '甲\n乙。丙' }, call);
     expect(Date.now() - started).toBeLessThan(500);
@@ -680,45 +715,55 @@ describe('分段发送', () => {
     await world.stop();
   });
 
-  it('段数超过上限时并进最后一段，回执说明合并', async () => {
-    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0, segmentMaxParts: 3 });
-    const receipt = String(await send.handler({ text: 'a\nb\nc\nd\ne' }, call));
-    expect(texts(srv)).toHaveLength(3);
-    expect(texts(srv)[2]).toBe('cde');
-    expect(receipt).toContain('合并');
+  it.each([3, 5])('达到分段阈值时恢复完整原文（%i 段），不再删标点或换行', async (count) => {
+    const { srv, world, send } = await ready({ segmentPace: 5, segmentMaxParts: 3 });
+    const text = Array.from({ length: count }, (_, i) => `第${i}段。`).join('\n');
+    const receipt = String(await send.handler({ text }, call));
+    expect(texts(srv)).toEqual([text]);
+    expect(receipt).toContain('取消语义分段');
+    expect(receipt).not.toContain('共等待');
+    await world.stop();
+  });
+
+  it('阈值触发后的超长原文仍按 4000 字分条，内容完整', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 5, segmentMaxParts: 3 });
+    const text = Array.from({ length: 8 }, () => `${'甲'.repeat(2000)}。`).join('\n');
+    const receipt = String(await send.handler({ text }, call));
+    const out = texts(srv);
+    expect(out.length).toBeGreaterThan(3);
+    for (const part of out) expect(part.length).toBeLessThanOrEqual(4000);
+    expect(out.join('')).toBe(text);
+    expect(receipt).not.toContain('共等待');
     await world.stop();
   });
 
   it('总等待到上限就停止等待，剩下的连着发完', async () => {
-    // 每段等 0.25 秒，但总上限只给 0.3 秒：第二条发完就不该再等。
     const { srv, world, send } = await ready({
-      segmentDelayFixedSec: 0.25, segmentMaxTotalSec: 0.3,
+      segmentPace: 0.5, segmentMaxTotalSec: 0.3,
     });
+    const text = Array.from({ length: 4 }, () => '甲'.repeat(30)).join('\n');
     const started = Date.now();
-    const receipt = String(await send.handler({ text: 'a\nb\nc\nd' }, call));
+    const receipt = String(await send.handler({ text }, call));
     const elapsed = Date.now() - started;
-    // 只允许等一次，明显小于「等三次」的 0.75 秒。
+    // 只允许等一次。
     expect(elapsed).toBeLessThan(600);
     expect(receipt).toContain('连着发完');
     expect(texts(srv)).toHaveLength(4);
     await world.stop();
   });
 
-  it('随机间隔落在配置区间内', async () => {
-    const { world, send } = await ready({
-      segmentDelayMode: 'random', segmentDelayMinSec: 0.05, segmentDelayMaxSec: 0.2,
-    });
-    const started = Date.now();
-    await send.handler({ text: 'a\nb\nc' }, call);
-    const elapsed = Date.now() - started;
-    // 两段间隔，各不超过 0.2 秒。
-    expect(elapsed).toBeGreaterThanOrEqual(80);
-    expect(elapsed).toBeLessThan(600);
+  it('很短与断句失效的特长消息都没有人工等待', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 10 });
+    for (const text of ['甲\n乙', '长'.repeat(301), '长'.repeat(4120)]) {
+      const receipt = String(await send.handler({ text }, call));
+      expect(receipt).not.toContain('共等待');
+    }
+    expect(texts(srv)).toEqual(['甲', '乙', '长'.repeat(301), '长'.repeat(4000), '长'.repeat(120)]);
     await world.stop();
   });
 
   it('超长但分段的文本：语义段与长度切分都生效', async () => {
-    const { srv, world, send } = await ready({ segmentDelayFixedSec: 0 });
+    const { srv, world, send } = await ready({ segmentPace: 0 });
     // 一段 5000 字（超过 4000 上限）+ 一段短的。
     const long = '甲'.repeat(5000);
     await send.handler({ text: `${long}\n乙` }, call);
@@ -726,6 +771,115 @@ describe('分段发送', () => {
     expect(out.length).toBeGreaterThanOrEqual(3);
     for (const piece of out) expect(piece.length).toBeLessThanOrEqual(4000);
     await world.stop();
+  });
+});
+
+describe('原生媒体投递', () => {
+  async function receiveMedia(opts: {
+    mime: string;
+    kind?: 'file' | 'voice' | 'video' | 'image';
+    filename?: string;
+    accept?: boolean;
+    imageMaxEdge?: number;
+  }) {
+    const srv = await startFakeServer();
+    server = srv;
+    const key = randomBytes(16);
+    const bytes = opts.mime.startsWith('image/') ? Buffer.alloc(33) : Buffer.from('media bytes');
+    if (opts.mime.startsWith('image/')) {
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes);
+      bytes.writeUInt32BE(1200, 16);
+      bytes.writeUInt32BE(800, 20);
+    }
+    srv.uploads.set('native', { ciphertext: encryptForTest(bytes, key), key });
+    const authDir = join(scratchDir, 'wechat-claw');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(join(authDir, 'auth.json'), JSON.stringify({
+      token: 'bot-token-123', baseUrl: srv.baseUrl, accountId: 'bot-account@im.bot',
+      userId: 'wx-user@im.wechat', savedAt: new Date().toISOString(),
+    }));
+    const host = new FakeHost();
+    host.acceptImages = false;
+    if (opts.accept !== false) host.acceptedMimes.add(opts.mime);
+    const world = makeWorld({
+      cfg: { ...WECHAT_CLAW_DEFAULTS, receiveVideos: true, ffmpegSource: 'off', imageMaxEdge: opts.imageMaxEdge ?? 4096 },
+      dataDir: scratchDir, server: srv,
+    });
+    await world.start(host);
+    const media = { encrypt_query_param: 'download-param-native', aes_key: key.toString('base64') };
+    const item = opts.kind === 'voice'
+      ? { type: 3, voice_item: { media, encode_type: 7, text: '微信给出的转写', playtime: 1000 } }
+      : opts.kind === 'video' ? { type: 5, video_item: { media } }
+        : opts.kind === 'image' ? { type: 2, image_item: { media } }
+          : { type: 4, file_item: { media, file_name: opts.filename, len: String(bytes.length) } };
+    srv.queue.push({ from_user_id: 'wx-user@im.wechat', message_type: 1, item_list: [item] });
+    await waitFor(() => host.events.some((e) => e.type === EVENT_MESSAGE), 5000);
+    const event = host.events.find((e) => e.type === EVENT_MESSAGE)!;
+    const blobs = (event as unknown as { blobs?: Array<{ mime: string; bytes: Uint8Array; name: string }> }).blobs ?? [];
+    return { srv, world, host, event, blobs, bytes };
+  }
+
+  it.each([
+    ['audio/mpeg', 'song.mp3'], ['audio/flac', 'song.flac'], ['video/mp4', 'clip.mp4'],
+    ['image/png', 'picture.png'], ['application/pdf', 'document.pdf'],
+  ])('文件通道中的 %s 根据 Provider 能力作为附件到达', async (mime, filename) => {
+    const { world, blobs, bytes } = await receiveMedia({ mime, filename });
+    try {
+      expect(blobs).toHaveLength(1);
+      expect(blobs[0].mime).toBe(mime);
+      expect(Buffer.from(blobs[0].bytes)).toEqual(bytes);
+    } finally { await world.stop(); }
+  });
+
+  it('原生视频不经过抽帧，ffmpeg 关闭且模型不支持图片也能投递', async () => {
+    const { world, event, blobs, bytes } = await receiveMedia({ mime: 'video/mp4', kind: 'video' });
+    try {
+      expect(blobs.map((b) => b.mime)).toEqual(['video/mp4']);
+      expect(Buffer.from(blobs[0].bytes)).toEqual(bytes);
+      expect(event.text).not.toContain('视频帧未');
+      expect(event.text).not.toContain('视频拼图');
+    } finally { await world.stop(); }
+  });
+
+  it('语音使用真实编码附上，保留服务端转写', async () => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'audio/mpeg', kind: 'voice' });
+    try {
+      expect(blobs[0].mime).toBe('audio/mpeg');
+      expect(blobs[0].name).toMatch(/\.mp3$/);
+      expect(event.text).toContain('微信给出的转写');
+    } finally { await world.stop(); }
+  });
+
+  it('图片按实际 PNG 能力检查，不要求模型支持所有图片格式', async () => {
+    const { world, blobs } = await receiveMedia({ mime: 'image/png', kind: 'image' });
+    try { expect(blobs.map((b) => b.mime)).toEqual(['image/png']); }
+    finally { await world.stop(); }
+  });
+
+  it('不支持音频时取消附件，正文给出 MIME 与原因', async () => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'audio/mpeg', filename: 'song.mp3', accept: false });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('未附：当前 Provider 不接受 audio/mpeg');
+    } finally { await world.stop(); }
+  });
+
+  it('图片超限原因会进入事件正文', async () => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'image/png', kind: 'image', imageMaxEdge: 512 });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('最长边超过 512');
+      expect(event.text).toContain('没有 ffmpeg');
+    } finally { await world.stop(); }
+  });
+
+  it('没有原生视频能力时继续走抽帧路径，并报告没有图片能力', async () => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'video/mp4', kind: 'video', accept: false });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('视频帧未提供');
+      expect(event.text).toContain('不接受图片输入');
+    } finally { await world.stop(); }
   });
 });
 
