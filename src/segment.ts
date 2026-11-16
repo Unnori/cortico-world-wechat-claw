@@ -18,9 +18,9 @@
  * ## 删谁不删谁
  *
  * - `\n`、`。`(U+3002)、`．`(U+FF0E) 删掉：中文社交软件里句号显得生硬，换行是版式。
- * - `.`(U+002E) **只在后面跟空白或位于结尾时**才算句号，删掉。否则 `3.14`、
+ * - 单个 `.`(U+002E) **只在后面跟空白或位于结尾时**才算句号，删掉。否则 `3.14`、
  *   `docs.nonebot.dev`、`report.2026.11.md` 会被切坏。
- * - `！？!?…～~` 只拆不删：它们带情绪，删了语气就变平。
+ * - `！？!?…～~` 与连续 ASCII 点组成的省略号只拆不删；连续语气符号整体保留。
  *
  * ## 哪条规则同时命中
  *
@@ -34,16 +34,44 @@ const HARD_STOPS = new Set(['。', '．']);
 /** 情绪标点：只拆不删。 */
 const SOFT_STOPS = new Set(['！', '？', '!', '?', '…', '～', '~']);
 
+/** 语气符号后的装饰、emoji 组成字符及右括号/右引号，不吸收下一句的左括号或货币符号。 */
+const SOFT_SUFFIX = /[\p{So}\p{M}\p{Emoji_Modifier}\p{Pe}\p{Pf}\u200d\u{e0020}-\u{e007f}]/u;
+
 /** 空白字符（用来判断 ASCII 句点后面是不是断句）。 */
 const isSpace = (ch: string | undefined): boolean => ch === undefined || /\s/.test(ch);
 
 /**
  * 判断位置 `i` 的 ASCII 句点算不算句号。
  *
- * 只有「后面是空白或已到结尾」才算。这样 `3.14`、`a.txt`、`example.com` 不会被拆。
+ * 单点后面是空白或已到结尾才算；连续点属于省略号，不能删掉最后一位。
  */
 function isAsciiStop(text: string, i: number): boolean {
-  return isSpace(text[i + 1]);
+  return text[i - 1] !== '.' && isSpace(text[i + 1]);
+}
+
+/** 语气标点的长度；连续点整体计数，保护 ../ 与 ..\\ 这类路径片段。 */
+function softStopLength(text: string, i: number): number {
+  if (SOFT_STOPS.has(text[i]!)) return 1;
+  if (text[i] !== '.' || text[i - 1] === '.' || text[i + 1] !== '.') return 0;
+  let end = i + 2;
+  while (text[end] === '.') end += 1;
+  if (/[/\\]/.test(text[i - 1] ?? '') || /[/\\]/.test(text[end] ?? '')) return 0;
+  return end - i;
+}
+
+/** 只在整串符号之后切一次；符号间的空白保留，末尾的空白留给分段时清理。 */
+function softClusterEnd(text: string, start: number, length: number): number {
+  let end = start + length;
+  while (end < text.length) {
+    let next = end;
+    while (next < text.length && /[^\S\r\n]/.test(text[next]!)) next += 1;
+    if (next === text.length) break;
+    const ch = String.fromCodePoint(text.codePointAt(next)!);
+    const size = softStopLength(text, next) || (SOFT_SUFFIX.test(ch) ? ch.length : 0);
+    if (!size) break;
+    end = next + size;
+  }
+  return end;
 }
 
 /** 一个切点：分隔符起点、终点，以及切完要不要把它留在前一段里。 */
@@ -80,15 +108,11 @@ function findCuts(text: string, kind: 'newline' | 'stop' | 'soft'): CutPoint[] {
       continue;
     }
     // kind === 'soft'：只拆不删，标点留在前一段。
-    if (SOFT_STOPS.has(ch)) {
-      // 成对的「！？」算一处，别拆两个空段。
-      const next = text[i + 1];
-      if (next && SOFT_STOPS.has(next) && ch + next === '！？') {
-        cuts.push({ start: i, end: i + 2, keep: true });
-        i += 1;
-        continue;
-      }
-      cuts.push({ start: i, end: i + 1, keep: true });
+    const length = softStopLength(text, i);
+    if (length) {
+      const end = softClusterEnd(text, i, length);
+      cuts.push({ start: i, end, keep: true });
+      i = end - 1;
     }
   }
   return cuts;
@@ -109,13 +133,14 @@ function pickKind(text: string): 'newline' | 'stop' | 'soft' | null {
  * 所以每段取完后剥掉尾部连续的 `。`／`．`／`.`。
  *
  * **只剥段尾**：`插件成熟度第一。文档齐全。` 里的第一个句号必须留着，否则句子粘在一起。
- * ASCII `.` 在这里无条件剥——它已经在段尾，不可能是小数或域名的一部分。
+ * ASCII 连续点是省略号，整串保留；只有单个句点会被剥掉。
  */
 function trimStopTail(piece: string): string {
   let out = piece;
   while (out) {
     const last = out[out.length - 1]!;
     if (!HARD_STOPS.has(last) && last !== '.') break;
+    if (last === '.' && out[out.length - 2] === '.') break;
     out = out.slice(0, -1);
   }
   return out.trimEnd();

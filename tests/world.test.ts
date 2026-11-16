@@ -690,6 +690,15 @@ describe('分段发送', () => {
     await world.stop();
   });
 
+  it('连续符号完整附在前一句，不单独发送符号碎片', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 0, segmentMaxParts: 4 });
+    try {
+      const receipt = String(await send.handler({ text: '好呀~♡ ......再想想……好啦!!!' }, call));
+      expect(texts(srv)).toEqual(['好呀~♡ ......', '再想想……', '好啦!!!']);
+      expect(receipt).not.toContain('取消语义分段');
+    } finally { await world.stop(); }
+  });
+
   it('中等长度在发送前按聊天节奏停顿', async () => {
     const { srv, world, send } = await ready({ segmentPace: 0.5 });
     const text = '甲'.repeat(30);
