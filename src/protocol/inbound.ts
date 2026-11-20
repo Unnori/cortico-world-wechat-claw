@@ -3,7 +3,7 @@
  *
  * `context_token` 是回复凭据，绝不进事件 meta、日志或模型上下文。
  * 媒体按类型下载解密后落到**桌宠工作区里的收件目录**（见 `paths.ts`），路径写进事件正文，
- * 字节作为附件交给模型（模型不支持该 MIME 时 Core 只发 `fallbackText`）。
+ * World 按实际 MIME 查询 Provider；受支持的字节作为事件附件交给 Core，其余保留路径与原因。
  *
  * 落盘位置与文件名都是给桌宠看的：目录按类型分，文件名保留对方给的原文名，
  * 后面接一个本地时间戳。这样它读得到、改得了，也能原样发回去。
@@ -12,7 +12,8 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { datedFileName, uniqueFileName } from '../paths.ts';
-import { extensionForInbound, imageSize, mimeFromFilename, sniffImageMime } from './mime.ts';
+import { extensionForInbound, imageSize, mimeForInbound, silkV3HeaderLength, sniffImageMime } from './mime.ts';
+import { silkToWav } from '../media/voice.ts';
 import type { MediaTransfer } from './media.ts';
 import { MessageItemType, type MessageItem, type WeixinMessage } from './types.ts';
 
@@ -216,9 +217,12 @@ export async function renderInbound(
         lines.push(missText(fetched, `语音 ${secondsText}`, opts.maxBytes));
         continue;
       }
-      const enc = voiceEncodingName(voice?.encode_type);
-      lines.push(`[语音 ${secondsText}，${enc} 编码，已存为 ${fetched.path}]`);
-      media.push({ ...fetched, kind: 'voice', label: `[语音 ${secondsText}]` });
+      const enc = fetched.mime === voiceMime(voice?.encode_type) ? voiceEncodingName(voice?.encode_type) : fetched.mime;
+      const { voiceConversion, ...file } = fetched;
+      const format = voiceConversion === 'wav' ? '已转为 WAV'
+        : voiceConversion === 'failed' ? 'SILK 转码失败，保留原音频' : `${enc} 编码`;
+      lines.push(`[语音 ${secondsText}，${format}，已存为 ${file.path}]`);
+      media.push({ ...file, kind: 'voice', label: `[语音 ${secondsText}]` });
       continue;
     }
     if (type === MessageItemType.IMAGE) {
@@ -286,7 +290,7 @@ export async function renderInbound(
 
 /** 媒体取回的结果：成功给路径，失败给一句能区分原因的话。 */
 type FetchOutcome =
-  | { ok: true; path: string; mime: string; bytes: number; width?: number; height?: number }
+  | { ok: true; path: string; mime: string; bytes: number; width?: number; height?: number; voiceConversion?: 'wav' | 'failed' }
   | { ok: false; reason: 'too-large' | 'no-ref' | 'failed' };
 
 /** 取一个媒体项的字节并按类型落盘。 */
@@ -334,7 +338,7 @@ async function fetchItem(
         maxBytes: opts.maxBytes,
       });
       const name = String(file?.file_name ?? '');
-      const mime = mimeFromFilename(name || 'file.bin');
+      const mime = mimeForInbound(bytes, name);
       const path = await saveMedia({
         bytes,
         dir: join(opts.inboxDir, 'files'),
@@ -352,12 +356,13 @@ async function fetchItem(
         aesKeyBase64: ref.aes_key,
         maxBytes: opts.maxBytes,
       });
+      const mime = mimeForInbound(bytes, '', 'video/mp4');
       const path = await saveMedia({
         bytes,
         dir: join(opts.inboxDir, 'videos'),
-        name: datedFileName(null, 'wx-video', '.mp4'),
+        name: datedFileName(null, 'wx-video', extensionForInbound(mime, bytes)),
       });
-      return { ok: true, path, mime: 'video/mp4', bytes: bytes.length };
+      return { ok: true, path, mime, bytes: bytes.length };
     }
     const voice = item.voice_item;
     const ref = voice?.media;
@@ -368,13 +373,24 @@ async function fetchItem(
       aesKeyBase64: ref.aes_key,
       maxBytes: opts.maxBytes,
     });
-    const mime = voiceMime(voice?.encode_type);
+    const mime = mimeForInbound(bytes, '', voiceMime(voice?.encode_type));
+    const dir = join(opts.inboxDir, 'voices');
+    let voiceConversion: 'failed' | undefined;
+    if (silkV3HeaderLength(bytes)) {
+      try {
+        const wav = await silkToWav(bytes, opts.maxBytes);
+        const path = await saveMedia({ bytes: wav, dir, name: datedFileName(null, 'wx-voice', '.wav') });
+        return { ok: true, path, mime: 'audio/wav', bytes: wav.length, voiceConversion: 'wav' };
+      } catch {
+        voiceConversion = 'failed';
+      }
+    }
     const path = await saveMedia({
       bytes,
-      dir: join(opts.inboxDir, 'voices'),
+      dir,
       name: datedFileName(null, 'wx-voice', extensionForInbound(mime, bytes)),
     });
-    return { ok: true, path, mime, bytes: bytes.length };
+    return { ok: true, path, mime, bytes: bytes.length, voiceConversion };
   } catch (err) {
     // 超限与取回失败要分开：前者是配置决定的，后者是网络或服务端问题。
     const tooLarge = err instanceof Error && /超过上限/.test(err.message);

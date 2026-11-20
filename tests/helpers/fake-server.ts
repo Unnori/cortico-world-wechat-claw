@@ -29,6 +29,9 @@ export interface FakeMessage {
 }
 
 export interface FakeServerOptions {
+  /** 每个 context_token 允许成功发送的条数。 */
+  maxRepliesPerContext?: number;
+  beforeSend?: (message: Record<string, unknown>) => Promise<void>;
   /** 收消息时一次给多少批；给空数组就一直返回空批次。 */
   batches?: FakeMessage[][];
   /** 二维码状态序列；默认直接 confirmed。 */
@@ -161,7 +164,15 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
         return;
       }
       const parsed = JSON.parse(body) as { msg?: Record<string, unknown> };
-      sent.push(parsed.msg ?? {});
+      const message = parsed.msg ?? {};
+      await opts.beforeSend?.(message);
+      const token = message.context_token;
+      if (opts.maxRepliesPerContext !== undefined
+        && sent.filter((msg) => msg.context_token === token).length >= opts.maxRepliesPerContext) {
+        sendJson(res, { ret: -2, errmsg: 'prepare failed' });
+        return;
+      }
+      sent.push(message);
       sendJson(res, { ret: 0, message_id: '9007199254740993' });
       return;
     }

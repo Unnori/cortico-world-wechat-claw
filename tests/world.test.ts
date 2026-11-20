@@ -4,22 +4,25 @@
  * 用真端口、真文件、真事件宿主；只有模型是假的（这里根本不调模型）。
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
-import type { EventEnvelope, ToolCallContext, WorldHost } from 'cortico/core/types.ts';
+import type { EventEnvelope, PushOptions, ToolCallContext, WorldHost } from 'cortico/core/types.ts';
+import { coerceGroupValues, setByPath } from 'cortico/core/config-schema.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 
 import { WECHAT_CLAW } from '../src/definition.ts';
-import { WECHAT_CLAW_DEFAULTS, type WechatClawConfigSection } from '../src/config.ts';
+import { WECHAT_CLAW_CONFIG_GROUP, WECHAT_CLAW_DEFAULTS, type WechatClawConfigSection } from '../src/config.ts';
 import { WechatClawWorld, EVENT_MESSAGE } from '../src/world.ts';
-import { encryptForTest, startFakeServer, type FakeServer } from './helpers/fake-server.ts';
+import { encryptForTest, startFakeServer, type FakeServer, type FakeServerOptions } from './helpers/fake-server.ts';
+import { silkVoiceFixture } from './helpers/voice-fixture.ts';
 
 /** 记录推送事件的假宿主；blob 与模型能力按需配置。 */
 class FakeHost implements WorldHost {
   events: EventEnvelope[] = [];
+  pushOptions: Array<PushOptions | undefined> = [];
   acceptImages = true;
   acceptedMimes = new Set<string>();
   log = nullLogger();
@@ -29,11 +32,11 @@ class FakeHost implements WorldHost {
       origin?: 'internal' | 'external';
       blobs?: unknown[];
     },
-    opts?: { deliver?: boolean; trigger?: string },
+    opts?: PushOptions,
   ): Promise<EventEnvelope> {
     const full = { ...event, cursor: this.events.length + 1, blobs: event.blobs } as unknown as EventEnvelope;
     this.events.push(full);
-    void opts;
+    this.pushOptions.push(opts);
     return full;
   }
 
@@ -216,7 +219,7 @@ describe('入站消息', () => {
   async function receive(
     message: Record<string, unknown>,
     opts: { cfg?: Partial<WechatClawConfigSection>; acceptImages?: boolean } = {},
-  ): Promise<{ world: WechatClawWorld; host: FakeHost; server: FakeServer }> {
+  ): Promise<{ world: WechatClawWorld; host: FakeHost; server: FakeServer; cfg: WechatClawConfigSection }> {
     const srv = await startFakeServer();
     server = srv;
     const cfg: WechatClawConfigSection = { ...WECHAT_CLAW_DEFAULTS, ...opts.cfg };
@@ -241,8 +244,42 @@ describe('入站消息', () => {
     srv.queue.push({ ...message, context_token: 'ctx-2' });
     // 等轮询把这条消息处理完。
     await waitFor(() => host.events.some((event) => event.type === EVENT_MESSAGE), 5000);
-    return { world, host, server: srv };
+    return { world, host, server: srv, cfg };
   }
+
+  it('投递方式经宿主配置校验后热生效，旧配置和未知值沿用合批', async () => {
+    const path = 'worlds.wechat-claw.inboundTrigger';
+    const group = WECHAT_CLAW_CONFIG_GROUP;
+    const property = group.schema.properties[path];
+    expect(property['x-hot']).toBe(true);
+    const options = WECHAT_CLAW.configOptions!(property['x-options']!, 'zh');
+    expect(options.map(option => option.value)).toEqual(['debounce', 'flush', 'preempt', 'interrupt', 'piggyback']);
+    expect(options[0].value).toBe(WECHAT_CLAW.defaults().inboundTrigger);
+
+    const message = { from_user_id: 'wx-user@im.wechat', message_type: 1,
+      item_list: [{ type: 1, text_item: { text: '测试投递方式' } }] };
+    const { world, host, server: srv, cfg } = await receive(message, { cfg: { inboundTrigger: undefined } });
+    const emitNext = async (expected: string) => {
+      const index = host.events.length;
+      srv.queue.push(message);
+      await waitFor(() => host.events.length > index, 5000);
+      expect(host.events[index].type).toBe(EVENT_MESSAGE);
+      expect(host.pushOptions[index]).toEqual({ deliver: true, trigger: expected });
+    };
+    try {
+      expect(host.pushOptions[0]).toEqual({ deliver: true, trigger: 'debounce' });
+      const root = { worlds: { 'wechat-claw': cfg } };
+      for (const { value } of options.slice(1)) {
+        const result = coerceGroupValues(group, { [path]: value }, 'zh');
+        if ('error' in result) throw new Error(result.error);
+        for (const [key, next] of Object.entries(result.values)) setByPath(root, key, next);
+        await emitNext(value);
+      }
+      expect(coerceGroupValues(group, { [path]: 'unknown' }, 'zh')).toHaveProperty('error');
+      setByPath(root, path, 'unknown');
+      await emitNext('debounce');
+    } finally { await world.stop(); }
+  });
 
   it('文本消息渲染成带发送者与时间的正文，并带 meta.raw 且不含 context_token', async () => {
     const { world, host } = await receive({
@@ -648,8 +685,8 @@ describe('入站消息', () => {
 
 describe('分段发送', () => {
   /** 绑定凭据并把 World 跑起来。 */
-  async function ready(cfg: Partial<WechatClawConfigSection> = {}) {
-    const srv = await startFakeServer();
+  async function ready(cfg: Partial<WechatClawConfigSection> = {}, serverOptions: FakeServerOptions = {}) {
+    const srv = await startFakeServer({ maxRepliesPerContext: 10, ...serverOptions });
     server = srv;
     const authDir = join(scratchDir, 'wechat-claw');
     mkdirSync(authDir, { recursive: true });
@@ -668,6 +705,122 @@ describe('分段发送', () => {
   /** 假服务端收到的文本正文。 */
   const texts = (srv: FakeServer): string[] =>
     srv.sent.map((msg) => String((msg.item_list as Array<{ text_item?: { text?: string } }>)[0]?.text_item?.text ?? ''));
+
+  it.each([[12, 11], [0, 10], [8, 8]])('配置 %i 时，%i 段已恢复完整原文，仍可补一句', async (threshold, count) => {
+    const { srv, world, send } = await ready({ segmentMaxParts: threshold, segmentPace: 0 });
+    try {
+      const text = Array.from({ length: count }, (_, i) => `第 ${i + 1} 段。`).join('\n');
+      await send.handler({ text }, call);
+      await send.handler({ text: '还有一句' }, call);
+      expect(texts(srv)).toEqual([text, '还有一句']);
+    } finally { await world.stop(); }
+  });
+
+  it('服务端提前拒绝时报告已发条数，同一凭据禁止重试，新消息恢复', async () => {
+    const { srv, world, host, send } = await ready({ segmentPace: 0 }, { maxRepliesPerContext: 2 });
+    const countRequests = () => srv.requests.filter(r => r.path.endsWith('/sendmessage')).length;
+    const inbound = (token: string, message: string) => srv.queue.push({ from_user_id: 'wx-user@im.wechat',
+      context_token: token, message_type: 1, item_list: [{ type: 1, text_item: { text: message } }] });
+    try {
+      await expect(send.handler({ text: '甲\n乙\n丙\n丁' }, call)).rejects.toThrow(/已发 2\/4 条.*ret=-2 prepare failed.*下一条/);
+      expect(texts(srv)).toEqual(['甲', '乙']);
+      expect(countRequests()).toBe(3);
+      inbound('ctx-1', '同一凭据');
+      await waitFor(() => host.events.some(e => e.type === EVENT_MESSAGE && e.text.includes('同一凭据')), 5000);
+      await expect(send.handler({ text: '重复' }, call)).rejects.toThrow(/下一条/);
+      expect(countRequests()).toBe(3);
+      inbound('ctx-2', '新的凭据');
+      await waitFor(() => host.events.some(e => e.type === EVENT_MESSAGE && e.text.includes('新的凭据')), 5000);
+      await send.handler({ text: '已恢复' }, call);
+      expect(srv.sent.at(-1)?.context_token).toBe('ctx-2');
+      expect(texts(srv)).toEqual(['甲', '乙', '已恢复']);
+    } finally { await world.stop(); }
+  });
+
+  it('旧凭据的拒绝回执晚于新消息时，新凭据仍可发信', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const { srv, world, host, send } = await ready({ segmentPace: 0 }, {
+      maxRepliesPerContext: 1,
+      beforeSend: async (message) => {
+        if (message.context_token === 'ctx-1' && srv.sent.length) await pending;
+      },
+    });
+    try {
+      await send.handler({ text: '已发' }, call);
+      const refused = expect(send.handler({ text: '旧凭据被拒' }, call)).rejects.toThrow(/ret=-2 prepare failed/);
+      await waitFor(() => srv.requests.filter(r => r.path.endsWith('/sendmessage')).length === 2, 5000);
+      srv.queue.push({ from_user_id: 'wx-user@im.wechat', context_token: 'ctx-2', message_type: 1,
+        item_list: [{ type: 1, text_item: { text: '新的凭据' } }] });
+      await waitFor(() => host.events.some(e => e.type === EVENT_MESSAGE && e.text.includes('新的凭据')), 5000);
+      release();
+      await refused;
+      await send.handler({ text: '已恢复' }, call);
+      expect(srv.sent.map(message => message.context_token)).toEqual(['ctx-1', 'ctx-2']);
+    } finally { release(); await world.stop(); }
+  });
+
+  it('同一凭据跨调用并发计数，余量不足时合并原文，重启仍阻止第 11 条', async () => {
+    const { srv, world, host, send } = await ready({ segmentPace: 0 });
+    const text = '第八段。\n第九段。\n第十段。';
+    const requestCount = () => srv.requests.filter(r => r.path.endsWith('/sendmessage')).length;
+    try {
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      const receipts = await Promise.all([
+        send.handler({ text }, call),
+        send.handler({ text: '补一句' }, call),
+        send.handler({ text: '结束' }, call),
+      ]);
+      expect(String(receipts[0])).toContain('取消语义分段');
+      expect(texts(srv).slice(7)).toEqual([text, '补一句', '结束']);
+      expect(requestCount()).toBe(10);
+      await world.stop();
+      const freshWorld = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+      await freshWorld.start(host);
+      try {
+        const reply = freshWorld.tools().find(t => t.name === 'wechat_send')!;
+        await expect(reply.handler({ text: '第 11 条' }, call)).rejects.toThrow(/配额已用尽.*下一条/);
+        expect(requestCount()).toBe(10);
+      } finally { await freshWorld.stop(); }
+    } finally { await world.stop(); }
+  });
+
+  it('接近上限时仍按 4000 字完整发送，条数不足则整次提前拒绝', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 0 });
+    try {
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      await send.handler({ text: '八' }, call);
+      await expect(send.handler({ text: '长'.repeat(8001) }, call)).rejects.toThrow(/需要 3 条.*只剩 2 条.*本次未发送/);
+      expect(texts(srv)).toHaveLength(8);
+      const text = ['甲'.repeat(2100), '乙'.repeat(2100), '丙'.repeat(2100)].join('\n');
+      await send.handler({ text }, call);
+      const tail = texts(srv).slice(8);
+      expect(tail).toHaveLength(2);
+      expect(tail.every(part => part.length <= 4000)).toBe(true);
+      expect(tail.join('')).toBe(text);
+    } finally { await world.stop(); }
+  });
+
+  it('附件与说明共用配额，只有一条额度时拒绝发送带说明的附件', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 0 });
+    const workspace = JSON.parse(String(await world.tools().find(t => t.name === 'wechat_status')!.handler({}, call))).workspace;
+    mkdirSync(workspace, { recursive: true });
+    const path = join(workspace, 'fixture.txt');
+    writeFileSync(path, 'fixture');
+    const file = world.tools().find(t => t.name === 'wechat_send_file')!;
+    try {
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      await file.handler({ path, caption: '第一个附件' }, call);
+      expect(srv.sent).toHaveLength(9);
+      const uploads = srv.requests.filter(r => r.path.endsWith('/getuploadurl')).length;
+      await expect(file.handler({ path, caption: '第二个附件' }, call)).rejects.toThrow(/需要 2 条.*只剩 1 条/);
+      expect(srv.sent).toHaveLength(9);
+      expect(srv.requests.filter(r => r.path.endsWith('/getuploadurl'))).toHaveLength(uploads);
+      await file.handler({ path }, call);
+      expect(srv.sent).toHaveLength(10);
+      await expect(send.handler({ text: '重复' }, call)).rejects.toThrow(/配额已用尽/);
+    } finally { await world.stop(); }
+  });
 
   it('按换行拆成多条发送，每条内容正确', async () => {
     const { srv, world, send } = await ready({ segmentPace: 0 });
@@ -790,11 +943,14 @@ describe('原生媒体投递', () => {
     filename?: string;
     accept?: boolean;
     imageMaxEdge?: number;
+    bytes?: Buffer;
+    cfg?: Partial<WechatClawConfigSection>;
+    configureHost?: (host: FakeHost) => void;
   }) {
     const srv = await startFakeServer();
     server = srv;
     const key = randomBytes(16);
-    const bytes = opts.mime.startsWith('image/') ? Buffer.alloc(33) : Buffer.from('media bytes');
+    const bytes = opts.bytes ?? (opts.mime.startsWith('image/') ? Buffer.alloc(33) : Buffer.from('media bytes'));
     if (opts.mime.startsWith('image/')) {
       Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes);
       bytes.writeUInt32BE(1200, 16);
@@ -810,8 +966,9 @@ describe('原生媒体投递', () => {
     const host = new FakeHost();
     host.acceptImages = false;
     if (opts.accept !== false) host.acceptedMimes.add(opts.mime);
+    opts.configureHost?.(host);
     const world = makeWorld({
-      cfg: { ...WECHAT_CLAW_DEFAULTS, receiveVideos: true, ffmpegSource: 'off', imageMaxEdge: opts.imageMaxEdge ?? 4096 },
+      cfg: { ...WECHAT_CLAW_DEFAULTS, receiveVideos: true, ffmpegSource: 'off', imageMaxEdge: opts.imageMaxEdge ?? 4096, ...opts.cfg },
       dataDir: scratchDir, server: srv,
     });
     await world.start(host);
@@ -825,18 +982,137 @@ describe('原生媒体投递', () => {
     await waitFor(() => host.events.some((e) => e.type === EVENT_MESSAGE), 5000);
     const event = host.events.find((e) => e.type === EVENT_MESSAGE)!;
     const blobs = (event as unknown as { blobs?: Array<{ mime: string; bytes: Uint8Array; name: string }> }).blobs ?? [];
-    return { srv, world, host, event, blobs, bytes };
+    return { srv, world, host, event, blobs, bytes, item };
   }
 
   it.each([
     ['audio/mpeg', 'song.mp3'], ['audio/flac', 'song.flac'], ['video/mp4', 'clip.mp4'],
     ['image/png', 'picture.png'], ['application/pdf', 'document.pdf'],
+    ['audio/aiff', 'song.aiff'], ['audio/webm', 'song.weba'], ['video/mpeg', 'clip.mpeg'],
+    ['video/3gpp', 'clip.3gp'], ['text/html', 'page.html'],
   ])('文件通道中的 %s 根据 Provider 能力作为附件到达', async (mime, filename) => {
     const { world, blobs, bytes } = await receiveMedia({ mime, filename });
     try {
       expect(blobs).toHaveLength(1);
       expect(blobs[0].mime).toBe(mime);
       expect(Buffer.from(blobs[0].bytes)).toEqual(bytes);
+    } finally { await world.stop(); }
+  });
+
+  it('改名 PDF 按文件头查询真实类型，并报告实际投递结果', async () => {
+    const { world, event, blobs, bytes } = await receiveMedia({
+      mime: 'application/pdf', filename: 'document.bin', bytes: Buffer.from('%PDF-1.7\nfixture\n%%EOF'),
+    });
+    try {
+      expect(blobs).toHaveLength(1);
+      expect(blobs[0].mime).toBe('application/pdf');
+      expect(Buffer.from(blobs[0].bytes)).toEqual(bytes);
+      expect(event.meta?.media).toEqual([expect.objectContaining({ mime: 'application/pdf', delivery: 'native', attachedMimes: ['application/pdf'] })]);
+      const status = JSON.parse(String(await world.tools().find(t => t.name === 'wechat_status')!.handler({ mimes: ['application/pdf'] }, call)));
+      expect(status.inputSupport.mimes['application/pdf']).toEqual({ accepted: true });
+      expect(status.lastInboundAttachments).toEqual([expect.objectContaining({ mime: 'application/pdf', delivery: 'native', attachedMimes: ['application/pdf'] })]);
+    } finally { await world.stop(); }
+  });
+
+  it('同一个 World 随模型能力热改重新判断附件，状态查询与实际投递一致', async () => {
+    const { srv, world, host, item } = await receiveMedia({ mime: 'application/pdf', filename: 'report.pdf' });
+    const status = world.tools().find(t => t.name === 'wechat_status')!;
+    try {
+      for (const accepted of [false, true]) {
+        host.acceptedMimes = new Set(accepted ? ['application/pdf'] : []);
+        const checked = JSON.parse(String(await status.handler({ mimes: ['application/pdf'] }, call)));
+        expect(checked.inputSupport.mimes['application/pdf'].accepted).toBe(accepted);
+        const count = host.events.filter(e => e.type === EVENT_MESSAGE).length;
+        srv.queue.push({ from_user_id: 'wx-user@im.wechat', message_type: 1, item_list: [item] });
+        await waitFor(() => host.events.filter(e => e.type === EVENT_MESSAGE).length > count, 5000);
+        const event = host.events.filter(e => e.type === EVENT_MESSAGE).at(-1)!;
+        expect(event.blobs?.length ?? 0).toBe(accepted ? 1 : 0);
+        expect(event.meta?.media).toEqual([expect.objectContaining({ delivery: accepted ? 'native' : 'omitted' })]);
+      }
+    } finally { await world.stop(); }
+  });
+
+  it('能力查询失败会报告错误，不会冒充已确认支持', async () => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'application/pdf', filename: 'report.pdf',
+      configureHost: host => { host.modelFacts.accepts = () => { throw new Error('provider is unavailable'); }; },
+    });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('附件能力查询失败');
+      expect(event.text).toContain('provider is unavailable');
+      const status = JSON.parse(String(await world.tools().find(t => t.name === 'wechat_status')!.handler({ mimes: ['application/pdf'] }, call)));
+      expect(status.inputSupport.mimes['application/pdf']).toEqual({ accepted: false, error: 'provider is unavailable' });
+    } finally { await world.stop(); }
+  });
+
+  it('微信视频通道中的 MOV 按真实容器投递，不写死成 MP4', async () => {
+    const { world, blobs } = await receiveMedia({ mime: 'video/quicktime', kind: 'video',
+      bytes: Buffer.from('\x00\x00\x00\x18ftypqt  fixture', 'latin1'),
+    });
+    try {
+      expect(blobs[0].mime).toBe('video/quicktime');
+      expect(blobs[0].name).toMatch(/\.mov$/);
+    } finally { await world.stop(); }
+  });
+
+  async function voicesDir(world: WechatClawWorld): Promise<string> {
+    const status = world.tools().find(t => t.name === 'wechat_status')!;
+    return join(JSON.parse(String(await status.handler({}, call))).inbox, 'voices');
+  }
+
+  it('微信 SILK 解密后转成 WAV，Provider 仅支持 WAV 时仍附上音频与转写', async () => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'audio/wav', kind: 'voice', bytes: await silkVoiceFixture() });
+    try {
+      expect(blobs).toHaveLength(1);
+      const wav = Buffer.from(blobs[0].bytes);
+      expect(blobs[0].mime).toBe('audio/wav');
+      expect(blobs[0].name).toMatch(/^wx-voice-\d{8}-\d{6}\.wav$/);
+      expect(wav.toString('ascii', 0, 4)).toBe('RIFF');
+      expect(wav.readUInt32LE(24)).toBe(24_000);
+      expect(wav.readUInt32LE(40)).toBe(wav.length - 44);
+      const dir = await voicesDir(world);
+      expect(readdirSync(dir)).toEqual([blobs[0].name]);
+      expect(readFileSync(join(dir, blobs[0].name))).toEqual(wav);
+      expect(event.text).toContain('已转为 WAV');
+      expect(event.text).toContain('微信给出的转写');
+    } finally { await world.stop(); }
+  });
+
+  it('损坏 SILK 回退落盘原语音，支持 WAV 的 Provider 收到转写和未附原因', async () => {
+    const bytes = Buffer.from('\x02#!SILK_V3fixture', 'latin1');
+    const { world, event, blobs } = await receiveMedia({ mime: 'audio/wav', kind: 'voice', bytes });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('微信给出的转写');
+      expect(event.text).toContain('SILK 转码失败');
+      expect(event.text).toContain('不接受 audio/silk');
+      const dir = await voicesDir(world);
+      const files = readdirSync(dir);
+      expect(files).toHaveLength(1);
+      expect(files[0]).toMatch(/\.silk$/);
+      expect(readFileSync(join(dir, files[0]))).toEqual(bytes);
+    } finally { await world.stop(); }
+  });
+
+  it('Provider 不支持 WAV 时只保存转码文件，仍投递转写与原因', async () => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'audio/wav', kind: 'voice', bytes: await silkVoiceFixture(), accept: false });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('微信给出的转写');
+      expect(event.text).toContain('不接受 audio/wav');
+      expect(readdirSync(await voicesDir(world))).toEqual([expect.stringMatching(/\.wav$/)]);
+    } finally { await world.stop(); }
+  });
+
+  it('下载关闭时即使 Provider 支持视频也不下载，状态标明接收开关', async () => {
+    const { srv, world, event, blobs } = await receiveMedia({ mime: 'video/mp4', kind: 'video', cfg: { receiveVideos: false } });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('未下载');
+      expect(srv.requests.some(r => r.path.includes('/download'))).toBe(false);
+      const status = JSON.parse(String(await world.tools().find(t => t.name === 'wechat_status')!.handler({ mimes: ['video/mp4'] }, call)));
+      expect(status.inputSupport.mimes['video/mp4'].accepted).toBe(true);
+      expect(status.inputSupport.receive.videos).toBe(false);
     } finally { await world.stop(); }
   });
 

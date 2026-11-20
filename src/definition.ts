@@ -1,7 +1,7 @@
 import { describeTools, type WorldDefinition } from 'cortico/world.ts';
 import type { DescribeText } from 'cortico/core/types.ts';
 
-import { WECHAT_CLAW_DEFAULTS, type WechatClawConfigSection } from './config.ts';
+import { DEFAULT_INBOUND_TRIGGER, INBOUND_TRIGGER_OPTIONS, inboundTriggerOptions, WECHAT_CLAW_DEFAULTS, type WechatClawConfigSection } from './config.ts';
 import { EVENT_LINK, EVENT_MESSAGE, WECHAT_CLAW_TOOL_DECLS, WechatClawWorld } from './world.ts';
 
 const TOOL_SUMMARIES: Record<string, DescribeText> = {
@@ -31,6 +31,7 @@ export const WECHAT_CLAW: WorldDefinition<WechatClawConfigSection> = {
   id: 'wechat-claw',
   label: '微信 ClawBot',
   defaults: () => ({ ...WECHAT_CLAW_DEFAULTS }),
+  configOptions: (kind, language) => kind === INBOUND_TRIGGER_OPTIONS ? inboundTriggerOptions(language) : [],
   create: (ctx) => new WechatClawWorld({
     cfg: ctx.cfg,
     // 工作区要从部署根推：`WorldContext` 不给 memoryDir，见 paths.ts。
@@ -44,10 +45,10 @@ export const WECHAT_CLAW: WorldDefinition<WechatClawConfigSection> = {
       {
         type: EVENT_MESSAGE,
         description: {
-          zh: '一条微信私聊消息；媒体路径写在正文里，Provider 支持的图片、音频、视频和文件作为附件到达。不支持原生视频时尝试抽帧，附件未提供的原因写在正文里。',
-          en: 'A WeChat 1:1 message with local media paths. Images, audio, video and files arrive as attachments when accepted by the Provider. Video falls back to frames; unavailable attachments include a reason.',
+          zh: '一条微信私聊消息。默认合并后投递，投递方式可在配置页修改。正文包含媒体路径，Provider 支持的文件随消息附上。不支持原生视频时尝试抽帧。',
+          en: 'A WeChat 1:1 message. Incoming messages are batched by default, and delivery can be configured. The message includes local media paths and attaches files accepted by the Provider. Video falls back to frames.',
         },
-        trigger: 'debounce',
+        trigger: DEFAULT_INBOUND_TRIGGER,
       },
       {
         type: EVENT_LINK,

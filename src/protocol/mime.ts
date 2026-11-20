@@ -13,12 +13,27 @@ const EXT_TO_MIME: Record<string, string> = {
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.bmp': 'image/bmp',
+  '.avif': 'image/avif',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
   '.mp4': 'video/mp4',
   '.mov': 'video/quicktime',
   '.webm': 'video/webm',
   '.mkv': 'video/x-matroska',
   '.avi': 'video/x-msvideo',
+  '.mpeg': 'video/mpeg',
+  '.mpg': 'video/mpeg',
+  '.m4v': 'video/mp4',
+  '.3gp': 'video/3gpp',
+  '.3g2': 'video/3gpp2',
+  '.ogv': 'video/ogg',
   '.mp3': 'audio/mpeg',
+  '.mpga': 'audio/mpeg',
+  '.aif': 'audio/aiff',
+  '.aiff': 'audio/aiff',
+  '.weba': 'audio/webm',
   '.ogg': 'audio/ogg',
   '.wav': 'audio/wav',
   '.m4a': 'audio/mp4',
@@ -27,6 +42,8 @@ const EXT_TO_MIME: Record<string, string> = {
   '.opus': 'audio/opus',
   '.amr': 'audio/amr',
   '.silk': 'audio/silk',
+  '.pcm': 'audio/pcm',
+  '.spx': 'audio/speex',
   '.pdf': 'application/pdf',
   '.doc': 'application/msword',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -36,6 +53,11 @@ const EXT_TO_MIME: Record<string, string> = {
   '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   '.txt': 'text/plain',
   '.md': 'text/markdown',
+  '.markdown': 'text/markdown',
+  '.html': 'text/html',
+  '.htm': 'text/html',
+  '.xml': 'application/xml',
+  '.rtf': 'application/rtf',
   '.csv': 'text/csv',
   '.json': 'application/json',
   '.zip': 'application/zip',
@@ -74,16 +96,66 @@ const MIME_TO_EXT: Record<string, string> = {
 };
 
 export const OCTET_STREAM = 'application/octet-stream';
+const SILK_V3_HEADER = Buffer.from('#!SILK_V3');
+
+/** SILK v3 头部长度。微信版在标准头前有一个 0x02。 */
+export function silkV3HeaderLength(bytes: Uint8Array): number {
+  const offset = bytes[0] === 0x02 ? 1 : 0;
+  return SILK_V3_HEADER.every((byte, i) => bytes[offset + i] === byte) ? offset + SILK_V3_HEADER.length : 0;
+}
 
 /** 文件名 → MIME；不认识的扩展名按二进制。 */
 export function mimeFromFilename(filename: string): string {
   return EXT_TO_MIME[extname(String(filename ?? '')).toLowerCase()] ?? OCTET_STREAM;
 }
 
+/** 入站文件先按可确认的容器头判类型，无法确认时保留文件名或微信编码给出的 MIME。 */
+export function mimeForInbound(bytes: Uint8Array, filename = '', fallback = OCTET_STREAM): string {
+  const hint = mimeFromFilename(filename);
+  const claimed = hint === OCTET_STREAM ? fallback : hint;
+  const b = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const head = b.toString('latin1', 0, 16);
+  const image = sniffImageMime(bytes);
+  if (image) return image;
+  if (head.startsWith('%PDF-')) return 'application/pdf';
+  if (head.startsWith('RIFF')) {
+    if (head.slice(8, 12) === 'WAVE') return 'audio/wav';
+    if (head.slice(8, 12) === 'AVI ') return 'video/x-msvideo';
+  }
+  if (head.startsWith('fLaC')) return 'audio/flac';
+  if (head.startsWith('OggS')) return claimed.startsWith('video/') ? 'video/ogg' : 'audio/ogg';
+  if (head.startsWith('FORM') && ['AIFF', 'AIFC'].includes(head.slice(8, 12))) return 'audio/aiff';
+  if (head.startsWith('#!AMR-WB')) return 'audio/amr-wb';
+  if (head.startsWith('#!AMR')) return 'audio/amr';
+  if (silkV3HeaderLength(bytes)) return 'audio/silk';
+  if (head.startsWith('ID3')) return 'audio/mpeg';
+  if (b.length >= 2 && b[0] === 0xff) {
+    if ((b[1]! & 0xf6) === 0xf0) return 'audio/aac';
+    if ((b[1]! & 0xe0) === 0xe0) return 'audio/mpeg';
+  }
+  if (head.slice(4, 8) === 'ftyp') {
+    const brand = head.slice(8, 12);
+    if (['avif', 'avis'].includes(brand)) return 'image/avif';
+    if (['heic', 'heix', 'hevc', 'hevx'].includes(brand)) return 'image/heic';
+    if (['mif1', 'msf1'].includes(brand)) return claimed === 'image/heic' ? claimed : 'image/heif';
+    if (brand === 'qt  ') return 'video/quicktime';
+    if (brand.startsWith('3g2')) return 'video/3gpp2';
+    if (brand.startsWith('3gp')) return 'video/3gpp';
+    // MP4、M4A 共用容器；音轨类型由品牌或原文件类型区分。
+    return brand === 'M4A ' || claimed.startsWith('audio/') ? 'audio/mp4' : 'video/mp4';
+  }
+  if (head.startsWith('\x1aE\xdf\xa3')) {
+    const prefix = b.toString('latin1', 0, Math.min(b.length, 4096));
+    if (prefix.includes('webm')) return claimed.startsWith('audio/') ? 'audio/webm' : 'video/webm';
+    if (prefix.includes('matroska')) return 'video/x-matroska';
+  }
+  return claimed;
+}
+
 /** MIME → 扩展名；不认识时 `.bin`。 */
 export function extensionFromMime(mime: string): string {
   const base = String(mime ?? '').split(';')[0].trim().toLowerCase();
-  return MIME_TO_EXT[base] ?? '.bin';
+  return MIME_TO_EXT[base] ?? Object.keys(EXT_TO_MIME).find((ext) => EXT_TO_MIME[ext] === base) ?? '.bin';
 }
 
 /** 按魔数猜图片类型，兜住入站图片没有文件名的情况。 */

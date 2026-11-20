@@ -1,4 +1,28 @@
-import type { ConfigGroup } from 'cortico/core/types.ts';
+import type { ConfigGroup, TriggerMode } from 'cortico/core/types.ts';
+
+export const DEFAULT_INBOUND_TRIGGER = 'debounce';
+export const INBOUND_TRIGGER_OPTIONS = 'wechat-claw-inbound-trigger';
+
+const INBOUND_TRIGGERS = {
+  debounce: { zh: '合并后投递（默认）', en: 'Batch incoming messages (default)' },
+  flush: { zh: '立即投递', en: 'Deliver immediately' },
+  preempt: { zh: '抢占尚未输出的回复', en: 'Preempt a reply before output' },
+  interrupt: { zh: '打断当前轮', en: 'Interrupt the current turn' },
+  piggyback: { zh: '随下一批投递', en: 'Wait for the next batch' },
+} satisfies Record<TriggerMode, { zh: string; en: string }>;
+
+export function inboundTriggerOptions(language: string) {
+  return Object.entries(INBOUND_TRIGGERS).map(([value, labels]) => ({
+    value,
+    label: language.startsWith('zh') ? labels.zh : labels.en,
+  }));
+}
+
+export function resolveInboundTrigger(value: unknown): TriggerMode {
+  return typeof value === 'string' && Object.hasOwn(INBOUND_TRIGGERS, value)
+    ? value as TriggerMode
+    : DEFAULT_INBOUND_TRIGGER;
+}
 
 /**
  * `config.json` 的 `worlds.wechat-claw` 段。
@@ -13,13 +37,15 @@ export interface WechatClawConfigSection {
   proxyUrl: string;
   /** direct/proxy 下强制 IPv4；系统 IPv6 路由坏掉时打开。 */
   forceIpv4: boolean;
+  /** 微信私聊消息在 Core 中的投递方式，提交事件时读取。 */
+  inboundTrigger: TriggerMode;
   /** 收图时是否下载并交给模型看。 */
   receiveImages: boolean;
   /** 收文件时是否下载。 */
   receiveFiles: boolean;
   /** 收视频时是否下载。 */
   receiveVideos: boolean;
-  /** 收语音时是否下载（微信语音是 SILK，落盘后由模型自行判断能否处理）。 */
+  /** 收语音时是否下载并将 SILK 转成 WAV。 */
   receiveVoices: boolean;
   /** 单条入站媒体上限，MB。超过只留占位，不下载。 */
   maxInboundMediaMb: number;
@@ -62,17 +88,20 @@ export interface WechatClawConfigSection {
   segmentEnabled: boolean;
   /** 按字数计算等待时长的倍率；0 表示不等待。 */
   segmentPace: number;
-  /** 语义段数达到此值就取消语义分段，仍遵守单条字数上限；0 表示不限。 */
+  /** 语义段数达到此值就取消语义分段，0 或旧值高于上限时使用 8。 */
   segmentMaxParts: number;
   /** 一次发送累计等待上限，秒；到点就把剩下的一起发完。 */
   segmentMaxTotalSec: number;
 }
+
+export const MAX_SEGMENT_THRESHOLD = 8;
 
 export const WECHAT_CLAW_DEFAULTS: WechatClawConfigSection = {
   enabled: false,
   networkMode: 'inherit',
   proxyUrl: '',
   forceIpv4: false,
+  inboundTrigger: DEFAULT_INBOUND_TRIGGER,
   receiveImages: true,
   receiveFiles: true,
   receiveVideos: false,
@@ -88,7 +117,7 @@ export const WECHAT_CLAW_DEFAULTS: WechatClawConfigSection = {
   ffmpegProxyUrl: '',
   segmentEnabled: true,
   segmentPace: 1,
-  segmentMaxParts: 12,
+  segmentMaxParts: MAX_SEGMENT_THRESHOLD,
   segmentMaxTotalSec: 30,
 };
 
@@ -144,6 +173,15 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
         description: 'direct/proxy 模式下强制 IPv4。连接一直超时且系统 IPv6 路由不可用时打开。修改后需重启。',
         'x-hot': false,
       },
+      'worlds.wechat-claw.inboundTrigger': {
+        type: 'string',
+        title: '微信消息投递方式',
+        description: '保存后对后续收到的微信消息生效。立即投递会结束合批等待。抢占只取消尚未输出且未在执行工具的模型请求。'
+          + '打断会停止当前轮，并可中止支持取消的工具。随下一批投递会等待其他事件唤醒。',
+        enum: Object.keys(INBOUND_TRIGGERS),
+        'x-options': INBOUND_TRIGGER_OPTIONS,
+        'x-hot': true,
+      },
       'worlds.wechat-claw.receiveImages': {
         type: 'boolean',
         title: '收图片',
@@ -155,25 +193,25 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
         title: '收文件',
         description:
           '打开后，对方发来的文件会下载到收件目录（默认工作区下的 `wechat-inbox/files`），'
-          + '路径写进上下文，模型可自行读取、修改，也能用 `wechat_send_file` 发回去。',
+          + 'Provider 支持的图片、音频、视频、PDF 等按实际 MIME 附在消息中；路径也会写进上下文。',
         'x-hot': true,
       },
       'worlds.wechat-claw.receiveVideos': {
         type: 'boolean',
         title: '收视频',
-        description: '打开后，对方发来的视频会下载到本地。视频体积大，默认关闭。',
+        description: '打开后下载微信视频消息，Provider 支持实际视频格式时直接附上，不支持时抽帧。体积大，默认关闭；使用原生视频也需打开。',
         'x-hot': true,
       },
       'worlds.wechat-claw.receiveVoices': {
         type: 'boolean',
         title: '收语音',
-        description: '打开后，对方发来的语音会下载到本地。微信优先给出服务端转写文本，语音本身是 SILK 编码。',
+        description: '打开后下载语音，自动将 SILK 转成 WAV。Provider 支持 WAV 时随转写一起附上，转码失败时保留原音频。',
         'x-hot': true,
       },
       'worlds.wechat-claw.maxInboundMediaMb': {
         type: 'number',
         title: '单条媒体上限（MB）',
-        description: '超过这个大小的附件不下载，只留一句占位说明。',
+        description: '超过此大小的附件只留占位。转码生成的 WAV 若超出此大小，则保留下载的 SILK 原件。',
         'x-hot': true,
       },
       'worlds.wechat-claw.ffmpegSource': {
@@ -252,8 +290,9 @@ export const WECHAT_CLAW_CONFIG_GROUP: ConfigGroup = {
         type: 'number',
         title: '分段阈值',
         description:
-          '语义段数达到这个值就取消分段，直接发送完整原文；超过微信单条 4000 字时仍按字数分条。0 表示不限。',
+          `语义段数达到此值时恢复完整原文，仍按微信单条 4000 字上限发送。最大 ${MAX_SEGMENT_THRESHOLD}，0 使用默认值。`,
         minimum: 0,
+        maximum: MAX_SEGMENT_THRESHOLD,
         'x-hot': true,
       },
       'worlds.wechat-claw.segmentMaxTotalSec': {

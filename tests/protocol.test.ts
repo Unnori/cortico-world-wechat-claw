@@ -14,7 +14,7 @@ import {
   encryptAesEcb,
   parseAesKey,
 } from '../src/protocol/crypto.ts';
-import { extensionFromMime, imageSize, mimeFromFilename, sniffImageMime } from '../src/protocol/mime.ts';
+import { extensionFromMime, imageSize, mimeForInbound, mimeFromFilename, sniffImageMime } from '../src/protocol/mime.ts';
 import { fileMessage, imageMessage, textMessage } from '../src/protocol/outbound.ts';
 import { MediaTransfer } from '../src/protocol/media.ts';
 import { startFakeServer } from './helpers/fake-server.ts';
@@ -300,6 +300,37 @@ describe('MediaTransfer 上传与下载', () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+describe('入站文件类型', () => {
+  it.each([
+    ['report.bin', '%PDF-1.7\nfixture', 'application/pdf'],
+    ['report.mp3', '%PDF-1.7\nfixture', 'application/pdf'],
+    ['', 'RIFF1234WAVEfmt ', 'audio/wav'],
+    ['song.bin', 'fLaCfixture', 'audio/flac'],
+    ['song.aif', 'FORM1234AIFF', 'audio/aiff'],
+    ['song.bin', 'OggSfixture', 'audio/ogg'],
+    ['video.ogv', 'OggSfixture', 'video/ogg'],
+    ['voice.bin', '\x02#!SILK_V3', 'audio/silk'],
+    ['voice.bin', '#!AMR\n', 'audio/amr'],
+    ['clip.bin', '\x00\x00\x00\x18ftypqt  ', 'video/quicktime'],
+    ['clip.bin', '\x00\x00\x00\x18ftypisom', 'video/mp4'],
+    ['song.m4a', '\x00\x00\x00\x18ftypisom', 'audio/mp4'],
+    ['clip.bin', '\x1aE\xdf\xa3\x42\x82webm', 'video/webm'],
+    ['song.weba', '\x1aE\xdf\xa3\x42\x82webm', 'audio/webm'],
+    ['photo.bin', '\x00\x00\x00\x18ftypavif', 'image/avif'],
+  ])('以文件头确认 %s 的实际类型', (name, content, mime) => {
+    expect(mimeForInbound(Buffer.from(content, 'latin1'), name)).toBe(mime);
+  });
+
+  it('无可确认头部时保留扩展名、原始音频编码或未知类型', () => {
+    expect(mimeForInbound(Buffer.from('data'), '报告.PDF')).toBe('application/pdf');
+    expect(mimeForInbound(Buffer.from('data'), 'recording.aiff')).toBe('audio/aiff');
+    expect(mimeForInbound(Buffer.from('data'), 'file.docx')).toBe('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    expect(mimeForInbound(Buffer.from('data'), '', 'audio/pcm')).toBe('audio/pcm');
+    expect(mimeForInbound(Buffer.from('data'), 'file.unknown')).toBe('application/octet-stream');
+    expect(mimeForInbound(Buffer.alloc(0))).toBe('application/octet-stream');
   });
 });
 

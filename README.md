@@ -21,7 +21,7 @@
 | 收文件 | 只显示 `[文件 名字]` 占位 | 解密落到 `wechat-inbox/files/`，保留对方给的原文名；她读得到、改得了，也能原样发回去 |
 | 发文件 | 不支持 | `wechat_send_file`：同上，带原文件名与明文长度；同样只限工作区 |
 | 上传来源 | —— | 只限工作区＋收件目录＋`sendExtraDirs`；先 `realpath` 再判定，`..` 与符号链接都绕不出去 |
-| 语音 | 占位 | 保留服务端转写文本；原音频落到 `wechat-inbox/voices/`，Provider 支持实际编码时同时附上 |
+| 语音 | 占位 | 保留服务端转写。SILK 转成 WAV 后落到 `wechat-inbox/voices/`，Provider 支持时一并附上 |
 | 长文本 | 超 4000 字被拒 | 自动切成多条发送，优先在段落与句号处断开 |
 | 出站视频 | 不支持 | 按 MIME 走视频通道，微信里显示成视频而不是附件 |
 | 入站超限 | 无区分 | 超限、缺参数、下载失败三种原因分别措辞 |
@@ -76,11 +76,12 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 | `networkMode` | `inherit` | `inherit` 跟随 Coopanion 的代理；`direct` 直连；`proxy` 用 `proxyUrl` |
 | `proxyUrl` | 空 | `proxy` 模式的 HTTP/HTTPS 代理，例如 `http://127.0.0.1:7890` |
 | `forceIpv4` | `false` | `direct`/`proxy` 下强制 IPv4 |
+| `inboundTrigger` | `debounce` | 微信消息投递方式。保存后对后续入站事件生效 |
 | `receiveImages` | `true` | 收图时下载并交给模型 |
-| `receiveFiles` | `true` | 收文件时下载 |
-| `receiveVideos` | `false` | 收视频时下载（体积大，默认关） |
-| `receiveVoices` | `true` | 收语音时下载 |
-| `maxInboundMediaMb` | `20` | 单条入站媒体上限，超过只留占位；也是出站媒体的上限 |
+| `receiveFiles` | `true` | 收文件时下载，Provider 接受实际 MIME 时附在消息中 |
+| `receiveVideos` | `false` | 收微信视频消息时下载（体积大，默认关）；原生理解也需开启 |
+| `receiveVoices` | `true` | 下载语音并将 SILK 转成 WAV |
+| `maxInboundMediaMb` | `20` | 单条入站与出站媒体上限。转换后的 WAV 超限时保留 SILK 原件 |
 | `inboxDir` | 空 | 收件目录。留空＝桌宠工作区下的 `wechat-inbox`；相对路径按工作区解析。改完要重启 |
 | `sendExtraDirs` | 空 | 额外允许发到微信的目录，一行一个（分号、逗号也行）。留空时只有工作区（与收件目录）能发 |
 | `ffmpegSource` | `auto` | 视频抽帧用哪份 ffmpeg：`auto` 先 PATH 再用面板装的那份、`path` 只用 PATH、`off` 不抽帧 |
@@ -91,7 +92,7 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 | `ffmpegProxyUrl` | 空 | 下载 ffmpeg 用的代理；留空直连（不继承只给模型用的那条代理） |
 | `segmentEnabled` | `true` | 分段发送：一次回复拆成多条微信消息 |
 | `segmentPace` | `1` | 聊天节奏，0～10；越大停顿越久，0 不等待 |
-| `segmentMaxParts` | `12` | 语义段数达到此阈值就恢复完整原文，仅按 4000 字上限分条；0 不限 |
+| `segmentMaxParts` | `8` | 语义段数达到此阈值就恢复完整原文，仅按 4000 字上限分条。0 使用默认值，旧配置大于 8 时按 8 执行 |
 | `segmentMaxTotalSec` | `30` | 累计等待上限，到点不再等但剩下的照常发完 |
 
 `bot_token`、同步游标和 `context_token` 都在 `<dataDir>/wechat-claw/`，不进配置、不进日志、不进事件 `meta.raw`。
@@ -106,7 +107,7 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 ├── images/     wx-image-20261108-144219.png
 ├── files/      报告-20261108-144219.pdf     ← 原文名在前，时间戳在后
 ├── videos/     wx-video-20261108-144219.mp4
-├── voices/     wx-voice-20261108-144219.silk
+├── voices/     wx-voice-20261108-144219.wav
 └── .derived/   压缩后的图、视频拼图（中间产物）
 ```
 
@@ -156,7 +157,9 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 
 **ASCII `.` 有额外保护**：单个点只在后面跟空白或位于结尾时才当句号。所以 `3.14`、`docs.nonebot.dev`、`report.2026.11.md` 不会被切坏。连续两个及以上的点按省略号保留，换行前也不会删掉；`../`、`..\` 这类路径片段不参与省略号分段。
 
-语义段数**达到** `segmentMaxParts` 时取消语义分段，保留原文的换行和标点直接发送。原文超过微信单条 4000 字时仍按长度分条，每条均不超限。累计等待超过 `segmentMaxTotalSec` 后不再等待，其余消息照常发完。
+语义段数**达到** `segmentMaxParts` 时取消语义分段，保留原文的换行和标点。按语义拆出的多条消息会用尽或超出剩余额度时，也会恢复完整原文。超过微信单条 4000 字时仍按长度分条。累计等待超过 `segmentMaxTotalSec` 后，其余消息连续发送。
+
+扩展按复现中的 10 条为每个 `context_token` 设置本地发送上限。文字、媒体和附件说明每成功发出一条都计入同一额度，重启后保留计数。发送前会核对剩余条数，完整内容发不下时会提前拒绝这次调用。收到 `ret=-2 prepare failed` 时会停用这次使用的凭据，报告已发送条数，等对方发来带新凭据的消息再恢复回复。
 
 「聊天节奏」控制每条消息发送前的停顿，默认 1：
 
@@ -172,6 +175,14 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 不想要就在配置页关掉「分段发送」。
 
 ## 视频抽帧
+
+入站文件按可确认的文件头识别 PDF、图片、音频和视频容器；无法确认时使用文件名或微信语音编码提供的类型。每次收件都调用宿主的 `modelFacts.accepts(实际 MIME)`，随当前模型、Provider 协议和输入开关变化。支持时通过事件 `blobs` 提交实际字节、MIME 与文件名；未知类型不会冒充支持的格式。
+
+可调用 `wechat_status`，传入 `{"mimes":["video/mp4","audio/wav","application/pdf"]}` 查看 `inputSupport`。`accepted` 是当前 Provider 的类型判断，`error` 表示查询失败；`receive` 是本扩展的下载开关。`lastInboundAttachments` 与事件的 `meta.media` 记录每份文件交给 Core 时的结果：`native` 为原样附件，`frames` 为视频拼图，`omitted` 为未附，原因在 `notes`。这不代表上游已经成功理解文件；字节、总请求大小等仍由 Provider 和上游校验。
+
+OpenCode 原生 Gemini 会将支持的音频、视频、PDF 等附件编码到请求的 `contents[].parts[].inlineData`。请先在 OpenCode 获取模型列表以更新格式声明，并确认所需输入类型未关闭。微信视频消息还需在本扩展打开「收视频」，文件通道发送的视频由「收文件」控制。微信 SILK 转码成功后使用 `audio/wav` 判断附件支持，服务端转写仍会投递。
+
+OpenCode Provider 必须包含 Gemini 工具回执附件保留修复：Core 将外部事件投递为工具回执，旧版转换只发送回执文字，即使 World 已提供 `blobs`，生成请求时仍会丢失媒体。仅更新本扩展不能修复 Provider 内部的这一步。
 
 当前 Provider 接受视频的实际 MIME 时，直接将视频作为事件附件交给 Core，不抽帧，也不需要 ffmpeg。只有 Provider 不接受视频时才走下面的抽帧流程。微信文件通道收到的 `.mp4`、`.mov` 等视频同样处理。
 
@@ -272,7 +283,7 @@ AES-128-ECB 加密 → POST 密文到微信 CDN → 从响应头 `x-encrypted-pa
 落到 `<工作区>/wechat-inbox/{images,files,videos,voices}/`（原文名 + 时间戳）→ 路径写进事件正文 →
 模型接受该 MIME 时字节作为附件随事件到达。
 
-能力查询使用 WorldHost 的 `modelFacts.accepts(mime)`，每条消息读取当前 Provider，不按模型名字猜能力。文件通道里的图片、音乐、视频和 Provider 接受的文档也会附上。图片仍经过体积、尺寸和数量限制；语音使用消息声明的实际编码，不把 MP3 误标成 SILK。不支持的编码或文件、读取失败与图片超限都会取消该附件，并把原因写进正文供桌宠告知用户。
+能力查询使用 WorldHost 的 `modelFacts.accepts(mime)`，每条消息读取当前 Provider，不按模型名字猜能力。文件通道里的图片、音乐、视频和 Provider 接受的文档也会附上。图片仍经过体积、尺寸和数量限制，语音按落盘后的实际 MIME 判断是否附上。不支持的编码或文件、读取失败与图片超限都会取消该附件，并把原因写进正文供桌宠告知用户。
 
 附件由 Core 和 Provider 转成上游请求。Provider 的 MIME 声明与请求实现必须同时支持该格式；上游拒绝请求时由 Core 显示具体错误，World 不在后台另发模型请求或重试。仅上游模型增加能力、Provider 仍声明只收图片时，原生音视频不会启用。
 
@@ -280,7 +291,15 @@ AES-128-ECB 加密 → POST 密文到微信 CDN → 从响应头 `x-encrypted-pa
 
 最近消息徽章按部署时区显示，例如 `11/16 16:37`。时间保存在部署数据目录的 `wechat-claw/status.json`，重启后恢复；旧版没有该文件时从当前绑定用户的归档事件恢复。解绑会清除状态。
 
-长轮询的 35 秒是请求等待上限，有消息时由服务端提前返回，并非固定每 35 秒收一次。入站事件使用 `debounce`，本地 Cortico 默认静默等待 2.5 秒合批，连续来消息时最长 15 秒；实际值取决于部署的 `batching` 配置。Core 正在调用模型或工具时还要等待相应的轮次边界。
+长轮询的 35 秒是请求等待上限，有消息时由服务端提前返回。默认「合并后投递」由 Core 的 `batching` 配置控制，本地 Cortico 默认静默等待 2.5 秒，连续收到消息时合批最长等待 15 秒。可在配置页的「微信消息投递方式」下拉框修改，保存后无需重启 World。
+
+| 投递方式 | 配置值 | 行为 |
+|---|---|---|
+| 合并后投递（默认） | `debounce` | 短暂等待，将连续消息合成一批 |
+| 立即投递 | `flush` | 立即放行积压，当前轮继续运行 |
+| 抢占尚未输出的回复 | `preempt` | 立即投递，可取消尚无外部输出且未在执行工具的模型轮 |
+| 打断当前轮 | `interrupt` | 立即投递并停止当前轮，已发出的回复保留 |
+| 随下一批投递 | `piggyback` | 消息入队，等其他事件唤醒 |
 
 媒体下载、压缩和视频抽帧在入站处理里依次执行，处理结束后才继续轮询，较大媒体会拖慢后续消息。原生视频路径跳过抽帧，减少这部分处理。`wechat_status.lastInboundTiming`、事件 `meta.timing` 与「微信入站消息已处理」日志分别提供：
 
@@ -299,7 +318,7 @@ AES-128-ECB 加密 → POST 密文到微信 CDN → 从响应头 `x-encrypted-pa
 - 只能回复，不能主动发起会话。回复需要对方最近一条消息的 `context_token`，约 24 小时后失效。
 - **只能发工作区里的文件**。要发外面的素材，先把目录写进 `sendExtraDirs`，或把文件复制进工作区。
 - 单条文本上限 4000 字；更长的回复由扩展自动分条，断行优先落在段落与句号上。
-- 微信语音通常是 SILK 编码，本扩展只落盘不解码；转写用服务端给的 `voice_item.text`，Provider 支持实际编码时附上原音频。没有转写且不支持该编码时，模型无法听到语音内容。
+- 微信 SILK v3 语音通过 `silk-wasm` 转成 24 kHz、16-bit、单声道 WAV，无需 ffmpeg。解码失败或 WAV 超过单条媒体上限时，保存原始 `.silk`。转写来自微信的 `voice_item.text`，Provider 接受落盘音频的 MIME 时一并附上。
 - Provider 不接受原生视频时，抽帧需要 ffmpeg；没有可用 ffmpeg 时不抽帧，正文会写明。不做本地音频转写。
 - 微信 ClawBot 是腾讯面向 OpenClaw 的官方通道，不是面向任意第三方 agent 的公开 SDK。条款、灰度范围、额度与接口都可能变化；发布前请核对当前条款。这个扩展不是腾讯或 Coopanion 的官方扩展。
 

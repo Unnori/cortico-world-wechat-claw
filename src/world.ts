@@ -38,7 +38,7 @@ import type {
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 
-import { ILinkApi, MAX_TEXT_CHARS, DEFAULT_BASE_URL, DEFAULT_CDN_BASE_URL, errorText } from './protocol/api.ts';
+import { ILinkApi, ILinkError, MAX_TEXT_CHARS, DEFAULT_BASE_URL, DEFAULT_CDN_BASE_URL, errorText } from './protocol/api.ts';
 import { MediaTransfer } from './protocol/media.ts';
 import { closeNetworkRoute, createNetworkRoute, type NetworkRoute } from './protocol/network.ts';
 import { fileMessage, imageMessage, textMessage, videoMessage } from './protocol/outbound.ts';
@@ -46,7 +46,7 @@ import { mimeFromFilename } from './protocol/mime.ts';
 import { clockText, messageTimeMs, renderInbound, shortId } from './protocol/inbound.ts';
 import { UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/types.ts';
 import { ILinkDriver } from './driver.ts';
-import { CredentialStore, type AuthRecord } from './store.ts';
+import { CredentialStore, MAX_REPLIES_PER_CONTEXT, type AuthRecord, type ReplyContext } from './store.ts';
 import { pickChannel, splitText } from './text.ts';
 import { fitImage, overCountNote, probeImage, type ImageLimits } from './media/imagefit.ts';
 import { MAX_FRAMES } from './media/layout.ts';
@@ -62,6 +62,8 @@ import {
   resolveWorkspaceDir,
 } from './paths.ts';
 import {
+  MAX_SEGMENT_THRESHOLD,
+  resolveInboundTrigger,
   WECHAT_CLAW_CONFIG_GROUP,
   wechatClawText,
   type WechatClawConfigSection,
@@ -76,6 +78,27 @@ const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url
 const PACKAGE_VERSION: string = pkg.version;
 /** 发消息时上报的观测标识，形状是 UA 的 `Name/Version`。 */
 const BOT_AGENT = `Cortico/6 (Coopanion; cortico-world-wechat-claw/${PACKAGE_VERSION})`;
+
+interface ReplyTarget {
+  to: string;
+  auth: AuthRecord;
+  context: ReplyContext;
+}
+
+const CONTEXT_EXHAUSTED = '当前入站消息的回复条数配额已用尽，请等对方发来下一条消息后再回复。';
+const CONTEXT_REJECTED = '服务端拒绝了本次回复，此回复凭据已停用（可能已用尽回复配额或失效），请等对方发来下一条消息后再回复。';
+
+type AttachmentBlob = Extract<BlobInput, { bytes: Uint8Array }>;
+
+interface InboundAttachment {
+  kind: string;
+  name: string;
+  mime: string;
+  bytes: number;
+  delivery: 'native' | 'frames' | 'omitted';
+  attachedMimes: string[];
+  notes: string[];
+}
 
 /** 绑定流程的界面状态。 */
 interface BindingState {
@@ -119,6 +142,7 @@ export const WECHAT_CLAW_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     description:
       'Send a WeChat reply to the person whose inbound message arrived most recently. '
       + 'The channel is one-to-one and reply-only: a context token from that message must still be valid. '
+      + 'Put the reply in one call when possible. Text, captions and media share the same reply allowance. '
       + `Text longer than ${MAX_TEXT_CHARS} characters is split into consecutive messages, so write the whole reply at once.`,
     parameters: {
       type: 'object',
@@ -174,8 +198,15 @@ export const WECHAT_CLAW_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     tags: ['read', 'snapshot'],
     description:
       'Report the WeChat ClawBot connection: bound account, whether the long poll is connected, '
-      + 'the last inbound message time, the last error and how many context tokens are held.',
-    parameters: { type: 'object', additionalProperties: false, properties: {} },
+      + 'the last inbound message time, the last error and how many context tokens are held. '
+      + 'Also reports live model input support, receive switches and the last attachment delivery results. '
+      + 'Pass mimes to check specific file types against the active Provider.',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        mimes: { type: 'array', maxItems: 128, items: { type: 'string', minLength: 1 }, description: 'Optional exact MIME types, such as audio/wav, video/mp4 or application/pdf.' },
+      },
+    },
   },
   {
     name: 'wechat_events',
@@ -237,9 +268,11 @@ export class WechatClawWorld implements World {
   #lastError = '';
   #lastMessageAt = '';
   #contextCount = 0;
+  #outbound = Promise.resolve();
   /** 段间等待的唤醒钩子；stop() 用它打断睡眠。 */
   #sleepWake: (() => void) | null = null;
   #lastInboundTiming: { receivedAt: string; receiveDelayMs: number; queueMs: number; processingMs: number } | null = null;
+  #lastInboundAttachments: InboundAttachment[] = [];
   #networkProblem = '';
   #ffmpeg: FfmpegResolution | null = null;
   /** ffmpeg 安装进度；null 表示没在装。 */
@@ -302,10 +335,10 @@ export class WechatClawWorld implements World {
   async #runTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<string> {
     try {
       switch (name) {
-        case 'wechat_send': return await this.#toolSendText(args);
-        case 'wechat_send_image': return await this.#toolSendMedia(args, 'image');
-        case 'wechat_send_file': return await this.#toolSendMedia(args, 'file');
-        case 'wechat_status': return this.#toolStatus();
+        case 'wechat_send': return await this.#queueSend(ctx, () => this.#toolSendText(args));
+        case 'wechat_send_image': return await this.#queueSend(ctx, () => this.#toolSendMedia(args, 'image'));
+        case 'wechat_send_file': return await this.#queueSend(ctx, () => this.#toolSendMedia(args, 'file'));
+        case 'wechat_status': return this.#toolStatus(args);
         case 'wechat_events': return this.#toolEvents(args);
         default: return `[wechat] 未知工具：${name}`;
       }
@@ -315,6 +348,18 @@ export class WechatClawWorld implements World {
     }
   }
 
+  /** 全部发送工具串行使用回复凭据，容量检查与发件不会被另一调用打断。 */
+  #queueSend(ctx: ToolCallContext, send: () => Promise<string>): Promise<string> {
+    const auth = this.#auth;
+    const outbound = this.#outbound.then(() => {
+      ctx.signal?.throwIfAborted();
+      if (auth !== this.#auth) throw new Error('微信绑定已变更，请在收到新消息后再回复。');
+      return send();
+    });
+    this.#outbound = outbound.then(() => {}, () => {});
+    return outbound;
+  }
+
   /**
    * 回复目标：**永远是绑定的微信本人**。
    *
@@ -322,23 +367,58 @@ export class WechatClawWorld implements World {
    * （群聊成员、服务通知、陌生人），回复目标就会被改写成对方，文件和文字都会发错人。
    * 这个插件只服务一对一私聊，所以收件人钉死在绑定记录里。
    */
-  #replyTarget(): { to: string; contextToken: string } {
-    if (!this.#driver || !this.#auth?.token) {
+  async #replyTarget(): Promise<ReplyTarget> {
+    const auth = this.#auth;
+    if (!this.#started || !this.#driver || !auth?.token) {
       throw new Error('微信未连接：先在「微信绑定」面板扫码，并确认本 World 已启用。');
     }
-    const to = String(this.#auth.userId ?? '').trim();
+    const to = auth.userId.trim();
     if (!to) {
       throw new Error('绑定记录里没有微信用户 ID，无法确定收件人。请在「微信绑定」面板解绑后重新扫码。');
     }
-    return { to, contextToken: '' };
-  }
-
-  async #requireContextToken(to: string): Promise<string> {
-    const token = await this.#store.getContextToken(to);
-    if (!token) {
+    const context = await this.#store.getReplyContext(to);
+    if (!context) {
       throw new Error('这条会话没有可用的 context_token：等对方再发一条消息后再回复。');
     }
-    return token;
+    if (context.rejected) throw new Error(CONTEXT_REJECTED);
+    if (context.sent >= MAX_REPLIES_PER_CONTEXT) throw new Error(CONTEXT_EXHAUSTED);
+    return { to, auth, context };
+  }
+
+  #ensureReplyCapacity(needed: number, remaining: number): void {
+    if (needed <= remaining) return;
+    throw new Error(`本次发送需要 ${needed} 条，当前入站消息只剩 ${remaining} 条回复额度。本次未发送，请缩短内容或等对方发来下一条消息。`);
+  }
+
+  async #recordReply(target: ReplyTarget, outcome: 'sent' | 'rejected'): Promise<void> {
+    try {
+      await this.#store.recordReply(target.to, target.context, outcome);
+    } catch (err) {
+      this.#host?.log?.warn?.('微信回复凭据状态未保存', { error: errorText(err) });
+    }
+    if (target.auth === this.#auth) this.#contextCount = await this.#store.countContextTokens();
+  }
+
+  #assertReplyActive(target: ReplyTarget): void {
+    if (!this.#started || target.auth !== this.#auth || !this.#driver) {
+      throw new Error('微信连接已停止或绑定已变更。');
+    }
+  }
+
+  async #sendReply(target: ReplyTarget, message: WeixinMessage, sent: number, total: number) {
+    try {
+      this.#assertReplyActive(target);
+      const response = await this.#requireApi().sendMessage(message);
+      await this.#recordReply(target, 'sent');
+      return response;
+    } catch (err) {
+      let reason = errorText(err);
+      if (err instanceof ILinkError && err.ret === -2 && /\bprepare\s+failed\b/i.test(err.message)) {
+        await this.#recordReply(target, 'rejected');
+        reason += `。${CONTEXT_REJECTED}`;
+      }
+      throw new Error(`微信回复已发 ${sent}/${total} 条。${reason}`, { cause: err });
+    }
   }
 
   /**
@@ -351,11 +431,13 @@ export class WechatClawWorld implements World {
   async #toolSendText(args: Record<string, unknown>): Promise<string> {
     const text = String(args.text ?? '').trim();
     if (!text) throw new Error('text 不能为空。');
-    const { to } = this.#replyTarget();
-    const contextToken = await this.#requireContextToken(to);
-    const api = this.#requireApi();
+    const target = await this.#replyTarget();
+    const { to } = target;
+    const contextToken = target.context.token;
+    const remaining = MAX_REPLIES_PER_CONTEXT - target.context.sent;
 
-    const { chunks, segmentationCancelled, waits } = this.#planChunks(text);
+    const { chunks, segmentationCancelled, waits } = this.#planChunks(text, remaining);
+    this.#ensureReplyCapacity(chunks.length, remaining);
 
     let sleptMs = 0;
     const maxTotalMs = Math.max(0, Number(this.#cfg.segmentMaxTotalSec) || 0) * 1000;
@@ -370,8 +452,7 @@ export class WechatClawWorld implements World {
         await this.#sleepMs(waitMs);
         sleptMs += waitMs;
       }
-      if (!this.#started) throw new Error(`微信发送已停止：已发送 ${i}/${chunks.length} 条。`);
-      await api.sendMessage(textMessage({ to, text: chunks[i]!, contextToken }));
+      await this.#sendReply(target, textMessage({ to, text: chunks[i]!, contextToken }), i, chunks.length);
     }
 
     this.#host?.log?.info?.('微信已发送文本', {
@@ -385,7 +466,7 @@ export class WechatClawWorld implements World {
 
     const bits: string[] = [];
     if (chunks.length > 1) bits.push(`分 ${chunks.length} 条`);
-    if (segmentationCancelled) bits.push('达到分段阈值，已取消语义分段并发送完整原文');
+    if (segmentationCancelled) bits.push('受分段阈值或剩余回复额度限制，已取消语义分段并发送完整原文');
     if (budgetCut) bits.push('等待到上限，其余连着发完');
     if (sleptMs > 0) bits.push(`共等待 ${(sleptMs / 1000).toFixed(1)} 秒`);
     const suffix = bits.length ? `，${bits.join('，')}` : '';
@@ -402,20 +483,28 @@ export class WechatClawWorld implements World {
    *
    * 分段关闭时退化成原来的行为：只按长度切、不等。
    */
-  #planChunks(text: string): { chunks: string[]; waits: number[]; segmentationCancelled: boolean } {
+  #planChunks(text: string, remaining: number): { chunks: string[]; waits: number[]; segmentationCancelled: boolean } {
     const enabled = this.#cfg.segmentEnabled !== false;
-    const seedParts = enabled ? splitSegments(text) : [text];
-    const maxParts = Math.floor(Number(this.#cfg.segmentMaxParts) || 0);
-    const segmentationCancelled = enabled && maxParts > 0 && seedParts.length >= maxParts;
-    const semantic = enabled && !segmentationCancelled;
-    const parts = semantic && seedParts.length ? seedParts : [text];
-    const planned = parts.flatMap((part) => {
-      const waitMs = semantic ? segmentDelayMs(part, this.#cfg.segmentPace) : 0;
-      return splitText(part, MAX_TEXT_CHARS, true).map((text) => ({ text, waitMs }));
-    });
-    const chunks = planned.map((part) => part.text);
-    const waits = planned.map((part) => part.waitMs);
-    return { chunks, waits, segmentationCancelled };
+    if (enabled) {
+      const parts = splitSegments(text);
+      const configured = Math.floor(Number(this.#cfg.segmentMaxParts));
+      const threshold = configured > 0 ? Math.min(configured, MAX_SEGMENT_THRESHOLD) : MAX_SEGMENT_THRESHOLD;
+      if (parts.length < threshold) {
+        const planned = (parts.length ? parts : [text]).flatMap((part) => {
+          const waitMs = segmentDelayMs(part, this.#cfg.segmentPace);
+          return splitText(part, MAX_TEXT_CHARS, true).map((text) => ({ text, waitMs }));
+        });
+        if (planned.length === 1 || planned.length < remaining) {
+          return { chunks: planned.map(p => p.text), waits: planned.map(p => p.waitMs), segmentationCancelled: false };
+        }
+      }
+    }
+    return { chunks: this.#splitToFit(text, remaining), waits: [], segmentationCancelled: enabled };
+  }
+
+  #splitToFit(text: string, remaining: number): string[] {
+    const chunks = splitText(text, MAX_TEXT_CHARS, true);
+    return chunks.length <= remaining ? chunks : splitText(text, MAX_TEXT_CHARS, true, false);
   }
 
   /** 等一会儿；`stop()` 时会被唤醒，避免关机干等半分钟。 */
@@ -461,6 +550,7 @@ export class WechatClawWorld implements World {
       );
     }
     const filePath = checked.path;
+    const target = await this.#replyTarget();
 
     const info = await stat(filePath).catch(() => null);
     if (!info?.isFile()) throw new Error(`找不到文件：${rawPath}`);
@@ -469,19 +559,16 @@ export class WechatClawWorld implements World {
       throw new Error(`文件超过上限（${Math.round(info.size / 1024 / 1024)} MB > ${Math.round(maxBytes / 1024 / 1024)} MB）。`);
     }
 
-    const { to } = this.#replyTarget();
-    const contextToken = await this.#requireContextToken(to);
-    const api = this.#requireApi();
-    const media = this.#requireMedia();
-    const bytes = await readFile(filePath);
-
+    const { to } = target;
+    const contextToken = target.context.token;
     const caption = String(args.caption ?? '').trim();
-    if (caption) {
-      const chunks = splitText(caption, MAX_TEXT_CHARS);
-      for (const chunk of chunks) {
-        await api.sendMessage(textMessage({ to, text: chunk, contextToken }));
-      }
-    }
+    const remaining = MAX_REPLIES_PER_CONTEXT - target.context.sent;
+    const chunks = caption ? this.#splitToFit(caption, remaining - 1) : [];
+    const total = chunks.length + 1;
+    this.#ensureReplyCapacity(total, remaining);
+    const bytes = await readFile(filePath);
+    this.#assertReplyActive(target);
+    const media = this.#requireMedia();
 
     const mime = mimeFromFilename(filePath);
     const channel = pickChannel(mime);
@@ -497,7 +584,10 @@ export class WechatClawWorld implements World {
       : channel === 'video'
         ? videoMessage({ to, uploaded, contextToken })
         : fileMessage({ to, fileName: basename(filePath), uploaded, contextToken });
-    const response = await api.sendMessage(message);
+    for (const [i, chunk] of chunks.entries()) {
+      await this.#sendReply(target, textMessage({ to, text: chunk, contextToken }), i, total);
+    }
+    const response = await this.#sendReply(target, message, chunks.length, total);
 
     this.#host?.log?.info?.('微信已发送媒体', {
       to: shortId(to),
@@ -524,8 +614,20 @@ export class WechatClawWorld implements World {
     return [...new Set(roots.filter(Boolean))];
   }
 
-  #toolStatus(): string {
+  #toolStatus(args: Record<string, unknown>): string {
     const state = this.#publicState();
+    if (args.mimes !== undefined && (!Array.isArray(args.mimes) || args.mimes.length > 128
+      || args.mimes.some((mime) => typeof mime !== 'string' || !mime.trim()))) {
+      throw new Error('mimes 必须是最多 128 项的 MIME 字符串数组。');
+    }
+    const mimes = [...new Set((args.mimes as string[] | undefined) ?? [
+      'image/png', 'image/jpeg', 'audio/mpeg', 'audio/wav', 'audio/silk', 'video/mp4', 'application/pdf', 'text/plain',
+      ...this.#lastInboundAttachments.map((item) => item.mime),
+    ])];
+    let model = '';
+    let modelError: string | undefined;
+    try { model = this.#host?.modelFacts.model() ?? ''; }
+    catch (err) { modelError = errorText(err); }
     return JSON.stringify({
       bound: state.bound,
       connected: state.connected,
@@ -536,6 +638,14 @@ export class WechatClawWorld implements World {
       userId: state.userId,
       lastMessageAt: state.lastMessageAt,
       lastInboundTiming: this.#lastInboundTiming,
+      lastInboundAttachments: this.#lastInboundAttachments,
+      inputSupport: {
+        model,
+        ...(modelError ? { error: modelError } : {}),
+        mimes: Object.fromEntries(mimes.map((mime) => [mime, this.#mimeSupport(mime)])),
+        receive: { images: this.#cfg.receiveImages !== false, files: this.#cfg.receiveFiles !== false,
+          videos: this.#cfg.receiveVideos === true, voices: this.#cfg.receiveVoices !== false },
+      },
       lastError: state.lastError,
       contextTokens: state.contextTokens,
       startedAt: state.startedAt,
@@ -778,6 +888,7 @@ export class WechatClawWorld implements World {
     this.#contextCount = 0;
     this.#lastMessageAt = '';
     this.#lastInboundTiming = null;
+    this.#lastInboundAttachments = [];
     this.#typingTickets.clear();
     this.#lastError = '';
 
@@ -1358,10 +1469,11 @@ export class WechatClawWorld implements World {
     const contextToken = String(message?.context_token ?? '').trim();
     if (contextToken) {
       try {
-        this.#contextCount = await this.#store.saveContextToken(from, contextToken);
+        await this.#store.saveContextToken(from, contextToken);
       } catch (err) {
         this.#host?.log?.warn?.('context_token 没存下来', { error: errorText(err) });
       }
+      this.#contextCount = await this.#store.countContextTokens();
     }
 
     try {
@@ -1381,42 +1493,55 @@ export class WechatClawWorld implements World {
       maxBytes,
     });
 
-    const blobs: BlobInput[] = [];
+    const blobs: AttachmentBlob[] = [];
     const host = this.#host;
     // 闸门里要写进正文的说明（压缩了哪张、哪张被丢掉、为什么）。
     const fitNotes: string[] = [];
+    const attachments: InboundAttachment[] = [];
     // 一次投递累计附了几张图，用来卡上限。
     let imageCount = 0;
     const limits = this.#imageLimits();
 
     for (const item of rendered.media) {
       if (driver !== this.#driver || !this.#started) return;
-      // 微信的文件通道也可能装着图片、音乐或视频，按实际 MIME 投递。
-      if (item.mime.startsWith('image/')) {
-        imageCount += 1;
-        if (imageCount > limits.maxCount) {
-          fitNotes.push(`[图片未附：${overCountNote(imageCount - 1, limits)}]`);
+      const before = blobs.length;
+      const noteIndex = fitNotes.length;
+      try {
+        // 微信的文件通道也可能装着图片、音乐或视频，按实际 MIME 投递。
+        if (item.mime.startsWith('image/')) {
+          imageCount += 1;
+          if (imageCount > limits.maxCount) {
+            fitNotes.push(`[图片未附：${overCountNote(imageCount - 1, limits)}]`);
+            continue;
+          }
+          await this.#attachImage(blobs, item, limits, fitNotes);
           continue;
         }
-        await this.#attachImage(blobs, item, limits, fitNotes);
-        continue;
-      }
-      const accepted = this.#acceptsMime(item.mime, fitNotes);
-      if (accepted) {
-        await this.#addBlob(blobs, item.path, item.mime, item.label, fitNotes);
-      } else if (item.mime.startsWith('video/')) {
-        const note = await this.#attachFrames(blobs, item.path, this.#acceptsMime('image/jpeg', fitNotes), limits, fitNotes, (n) => {
-          imageCount += n;
-          return imageCount;
-        });
-        if (note) fitNotes.push(note);
-        else if (!(Number(this.#cfg.videoFrames) > 0)) fitNotes.push('[视频未附：当前 Provider 不接受此视频格式，且已关闭抽帧]');
-      } else {
-        fitNotes.push(`${item.label} 未附：当前 Provider 不接受 ${item.mime} 输入。`);
+        const support = this.#mimeSupport(item.mime);
+        if (support.error) {
+          fitNotes.push(`${item.label} 未附：附件能力查询失败（${item.mime}，${support.error}）。`);
+        } else if (support.accepted) {
+          await this.#addBlob(blobs, item.path, item.mime, item.label, fitNotes);
+        } else if (item.mime.startsWith('video/')) {
+          const note = await this.#attachFrames(blobs, item.path, this.#acceptsMime('image/jpeg', fitNotes), limits, fitNotes, (n) => {
+            imageCount += n;
+            return imageCount;
+          });
+          if (note) fitNotes.push(note);
+          else if (!(Number(this.#cfg.videoFrames) > 0)) fitNotes.push('[视频未附：当前 Provider 不接受此视频格式，且已关闭抽帧]');
+        } else {
+          fitNotes.push(`${item.label} 未附：当前 Provider 不接受 ${item.mime} 输入。`);
+        }
+      } finally {
+        const attachedMimes = blobs.slice(before).map((blob) => blob.mime);
+        attachments.push({ kind: item.kind, name: basename(item.path), mime: item.mime, bytes: item.bytes,
+          delivery: attachedMimes.length ? (item.mime.startsWith('video/') && attachedMimes[0].startsWith('image/') ? 'frames' : 'native') : 'omitted',
+          attachedMimes, notes: fitNotes.slice(noteIndex) });
       }
     }
 
     if (driver !== this.#driver || !this.#started) return;
+    this.#lastInboundAttachments = attachments;
     this.#lastInboundTiming = {
       receivedAt: new Date(receivedAtMs).toISOString(),
       receiveDelayMs: Math.max(0, receivedAtMs - atMs),
@@ -1443,27 +1568,38 @@ export class WechatClawWorld implements World {
         raw: rendered.raw,
         ...(rendered.transcript ? { transcript: rendered.transcript } : {}),
         ...(rendered.quote ? { quote: rendered.quote } : {}),
-        media: rendered.media.map((item) => ({ kind: item.kind, mime: item.mime, bytes: item.bytes, label: item.label })),
+        media: rendered.media.map((item, i) => ({ ...attachments[i], label: item.label })),
         timing: this.#lastInboundTiming,
       },
-    }, { deliver: true, trigger: 'debounce' });
+    }, { deliver: true, trigger: resolveInboundTrigger(this.#cfg.inboundTrigger) });
 
     // 输入状态是锦上添花：拿不到 ticket 就跳过。
     void this.#signalTyping(from, contextToken);
   }
 
-  #acceptsMime(mime: string, notes: string[]): boolean {
+  #mimeSupport(mime: string): { accepted: boolean; error?: string } {
+    if (!this.#host?.modelFacts) return { accepted: false, error: 'World 未运行或宿主未提供模型能力查询。' };
     try {
-      return this.#host?.modelFacts?.accepts(mime) ?? false;
+      return { accepted: this.#host.modelFacts.accepts(mime) };
     } catch (err) {
-      notes.push(`[附件能力查询失败：${errorText(err)}]`);
-      return false;
+      return { accepted: false, error: errorText(err) };
     }
   }
 
+  #acceptsMime(mime: string, notes: string[]): boolean {
+    const result = this.#mimeSupport(mime);
+    if (result.error) notes.push(`[附件能力查询失败：${mime}，${result.error}]`);
+    return result.accepted;
+  }
+
   /** 读取失败或能力不支持时取消附件，并在事件正文告知原因。 */
-  async #addBlob(blobs: BlobInput[], path: string, mime: string, label: string, notes: string[]): Promise<void> {
-    if (!this.#acceptsMime(mime, notes)) {
+  async #addBlob(blobs: AttachmentBlob[], path: string, mime: string, label: string, notes: string[]): Promise<void> {
+    const support = this.#mimeSupport(mime);
+    if (support.error) {
+      notes.push(`${label} 未附：附件能力查询失败（${mime}，${support.error}）。`);
+      return;
+    }
+    if (!support.accepted) {
       notes.push(`${label} 未附：当前 Provider 不接受 ${mime} 输入。`);
       return;
     }
@@ -1498,7 +1634,7 @@ export class WechatClawWorld implements World {
    * 先看元数据再决定读不读内容：32 MB 的图不该先整读进内存再判断。
    */
   async #attachImage(
-    blobs: BlobInput[],
+    blobs: AttachmentBlob[],
     item: { path: string; mime: string; label: string; bytes?: number },
     limits: ImageLimits,
     notes: string[],
@@ -1536,7 +1672,7 @@ export class WechatClawWorld implements World {
    * 抽不出来时返回一句写进正文的说明——**不假装看过视频**。
    */
   async #attachFrames(
-    blobs: BlobInput[],
+    blobs: AttachmentBlob[],
     videoPath: string,
     acceptsImages: boolean,
     limits: ImageLimits,

@@ -12,7 +12,7 @@ const SENTENCE_END = /[。！？；…!?;\n]/;
  * 把 `text` 切成每段不超过 `limit` 的若干段。
  * 不超限时原样返回单元素数组，调用方不必区分两种情况。
  */
-export function splitText(text: string, limit: number, preserveWhitespace = false): string[] {
+export function splitText(text: string, limit: number, preserveWhitespace = false, preferBoundaries = true): string[] {
   const max = Math.max(1, Math.floor(limit));
   if (text.length <= max) return [text];
 
@@ -22,9 +22,9 @@ export function splitText(text: string, limit: number, preserveWhitespace = fals
   while (rest.length > max) {
     const window = rest.slice(0, max);
     // 段落优先：最后一个换行。
-    let cut = window.lastIndexOf('\n');
+    let cut = preferBoundaries ? window.lastIndexOf('\n') : -1;
     // 其次句子：窗口内最后一个句末标点。
-    if (cut < max * 0.5) {
+    if (preferBoundaries && cut < max * 0.5) {
       for (let i = window.length - 1; i >= 0; i -= 1) {
         if (SENTENCE_END.test(window[i]!)) {
           cut = i + 1;
