@@ -29,6 +29,10 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v8
         with:
           name: npm-package
