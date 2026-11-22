@@ -88,4 +88,4 @@ jobs:
             echo 'Expected exactly one verified npm archive' >&2
             exit 1
           fi
-          npm publish "${archives[0]}" --ignore-scripts --access public
+          npm publish "./${archives[0]}" --ignore-scripts --access public
