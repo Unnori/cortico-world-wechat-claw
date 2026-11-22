@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-wechat-claw",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "type": "module",
   "description": "在微信里和桌宠一对一聊天：文字、图片、文件双向收发，按 Provider 能力传入原生音视频，不支持视频时抽帧理解。",
   "author": {
@@ -27,7 +27,7 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
   "packageManager": "pnpm@11.28.6",
   "main": "./src/index.ts",
@@ -37,10 +37,10 @@
     "displayName": "微信 ClawBot",
     "icon": "assets/icon.png",
     "describe": "describe.json",
-    "webUiClient": "dist/webui.js",
+    "webUiClient": "dist/webui-tts-discovery.js",
+    "webUiStyle": "dist/webui-tts-discovery.css",
     "tags": [
       "im",
-      "unsafe",
       "unofficial-api"
     ],
     "locales": {
@@ -69,6 +69,8 @@
     "build": "node scripts/build-webui.mjs"
   },
   "dependencies": {
+    "@breezystack/lamejs": "1.2.7",
+    "mpg123-decoder": "1.0.3",
     "qrcode": "^1.5.4",
     "silk-wasm": "3.7.1",
     "undici": "^8.12.3"

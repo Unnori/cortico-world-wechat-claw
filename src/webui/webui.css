@@ -1,0 +1,192 @@
+.wechat-claw-console > h3 {
+  margin-bottom: 10px;
+}
+
+.wechat-claw-console .wcc-binding-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  padding: 14px 16px;
+  background: var(--sheet-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 10px);
+}
+
+.wechat-claw-console .wcc-binding-row > .actionbar {
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.wechat-claw-console .wcc-binding-facts {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wechat-claw-console .wcc-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.wechat-claw-console .wcc-account {
+  font-weight: 600;
+}
+
+.wechat-claw-console .wcc-detail {
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.wechat-claw-console .qrbox {
+  margin-block: 16px 10px;
+}
+
+.wechat-claw-console .qrbox .qr {
+  width: min(240px, 100%);
+  height: auto;
+}
+
+.wechat-claw-console .wcc-services {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.wechat-claw-console .wcc-service {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 16px;
+  background: var(--sheet-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 10px);
+  overflow-wrap: anywhere;
+}
+
+.wechat-claw-console .wcc-service .sectionhead {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.wechat-claw-console .wcc-service .sectionhead h4 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 0.96rem;
+  font-weight: 600;
+}
+
+.wechat-claw-console .wcc-service .msgline {
+  margin: 0;
+}
+
+.wechat-claw-console .wcc-service > .actionbar {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  margin: auto 0 0;
+  padding-top: 8px;
+  border: 0;
+}
+
+.wechat-claw-console .wcc-service .btn.primary,
+.wcc-tts-drawer .btn.primary {
+  color: var(--on-accent, #fff);
+}
+
+.wechat-claw-console .wcc-progress {
+  width: 100%;
+  height: 6px;
+  accent-color: var(--accent);
+}
+
+.wechat-claw-console .wcc-tts-off:not(.bad) {
+  color: var(--ink-soft);
+}
+
+.wcc-tts-drawer,
+.wcc-tts-form,
+.wcc-tts-service,
+.wcc-tts-key {
+  display: grid;
+  gap: 14px;
+}
+
+.wcc-tts-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10.5rem), 1fr));
+  align-items: start;
+  gap: 12px;
+}
+
+.wcc-tts-lookup {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wcc-tts-lookup > .btn {
+  justify-self: start;
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+
+.wcc-tts-lookup > .btn:hover {
+  border-color: var(--line-strong);
+}
+
+.wcc-tts-lookup > .msgline:empty {
+  display: none;
+}
+
+.wcc-tts-key {
+  margin-top: 4px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  gap: 6px;
+}
+
+.wcc-tts-key > .rowbar {
+  align-items: flex-end;
+}
+
+.wcc-tts-key > .rowbar > label {
+  flex: 1 1 13rem;
+}
+
+.wcc-tts-drawer label {
+  min-width: 0;
+}
+
+.wcc-tts-drawer input.field,
+.wcc-tts-drawer select.field {
+  width: 100%;
+  min-width: 0;
+}
+
+.wcc-tts-drawer .msgline {
+  margin: 0;
+}
+
+.wcc-tts-discovery-actions {
+  flex-wrap: wrap;
+}
+
+.wcc-tts-service .msgline:empty {
+  display: none;
+}
+
+.wcc-tts-discovery-actions > select.field {
+  width: auto;
+  flex: 1 1 13rem;
+  min-width: 0;
+}

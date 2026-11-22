@@ -86,6 +86,7 @@ export class MediaTransfer {
     if (!fullUrl && !uploadParam) {
       throw new Error('服务端没有给上传地址（upload_full_url 与 upload_param 都为空）');
     }
+    // upload_param 只用于上传地址。消息的 CDN 引用来自实际上传响应的 x-encrypted-param。
     const url = fullUrl || buildCdnUploadUrl({ cdnBaseUrl: this.#cdnBaseUrl, uploadParam, filekey });
 
     const ciphertext = encryptAesEcb(plaintext, aesKey);

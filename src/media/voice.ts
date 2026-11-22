@@ -1,9 +1,9 @@
 import { silkV3HeaderLength } from '../protocol/mime.ts';
 
-const SAMPLE_RATE = 24_000;
+export const SILK_SAMPLE_RATE = 24_000;
 const WAV_HEADER_BYTES = 44;
 const SILK_PACKET_MAX_BYTES = 250 * 5;
-const PCM_BYTES_PER_20_MS = SAMPLE_RATE * 2 / 50;
+const PCM_BYTES_PER_20_MS = SILK_SAMPLE_RATE * 2 / 50;
 const SILK_TENCENT_PREFIX = Buffer.from([0x02]);
 const SILK_END = Buffer.from([0xff, 0xff]);
 
@@ -59,9 +59,9 @@ export async function silkToWav(silk: Buffer, maxBytes: number): Promise<Buffer>
   if (packets === 1) parts.push(silk.subarray(headerLength, end));
   parts.push(SILK_END);
   const { decode } = await import('silk-wasm');
-  const { data } = await decode(Buffer.concat(parts), SAMPLE_RATE);
+  const { data } = await decode(Buffer.concat(parts), SILK_SAMPLE_RATE);
   if (packets === 1 && data.byteLength % 4 !== 0) throw new Error('SILK 解码得到不完整的采样。');
   const pcm = packets === 1 ? data.subarray(0, data.byteLength / 2) : data;
   if (WAV_HEADER_BYTES + pcm.byteLength > maxBytes) throw new Error('WAV 超过单条媒体上限。');
-  return pcm16ToWav(pcm, SAMPLE_RATE, 1);
+  return pcm16ToWav(pcm, SILK_SAMPLE_RATE, 1);
 }

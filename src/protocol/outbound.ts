@@ -96,6 +96,34 @@ export function videoMessage(params: {
   });
 }
 
+/** 微信原生语音项。playtime 使用毫秒，CDN 引用与其他媒体共用同一套加密字段。 */
+export function voiceMessage(params: {
+  to: string;
+  uploaded: UploadedMedia;
+  sampleRate: number;
+  durationMs: number;
+  contextToken?: string;
+}): WeixinMessage {
+  return envelope({
+    to: params.to,
+    contextToken: params.contextToken,
+    item: {
+      type: MessageItemType.VOICE,
+      voice_item: {
+        media: {
+          encrypt_query_param: params.uploaded.downloadQueryParam,
+          aes_key: encodeAesKeyHex(params.uploaded.aesKeyHex),
+          encrypt_type: 1,
+        },
+        encode_type: 6,
+        bits_per_sample: 16,
+        sample_rate: params.sampleRate,
+        playtime: params.durationMs,
+      },
+    },
+  });
+}
+
 /** 文件项：`len` 是明文字节数的十进制字符串。 */
 export function fileMessage(params: {
   to: string;

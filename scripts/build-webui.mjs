@@ -10,7 +10,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const outFile = resolve(root, 'dist/webui.js');
+const outFile = resolve(root, 'dist/webui-tts-discovery.js');
 
 mkdirSync(dirname(outFile), { recursive: true });
 

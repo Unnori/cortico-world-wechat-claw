@@ -1,5 +1,5 @@
 ﻿/**
- * 「微信绑定」面板。
+ * 「连接与工具」面板。
  *
  * 走内建 UI 原语（`ctx.ui`），不碰 document.body，不直连 /api/；数据一律经 `ctx.invoke`
  * 打到 World 的 `webUi().invoke`。
@@ -10,6 +10,8 @@
 import type { WebUiPanelContext, WebUiClientBundle } from 'cortico/web/shared/client-panel.ts';
 
 import { mountFfmpeg } from './ffmpeg.ts';
+import { mountTts } from './tts.ts';
+import './webui.css';
 
 /** 与 World 的 `#publicState()` 对应的字段。 */
 interface BindingState {
@@ -22,10 +24,8 @@ interface BindingState {
   /** 已按部署时区格式化好的本地时间；优先用它，别直接截 lastMessageAt。 */
   lastMessageLocal: string;
   lastError: string;
-  contextTokens: number;
   qrDataUrl: string;
   qrUrl: string;
-  loginStatus: string;
   loginError: string;
   verifyRequired: boolean;
 }
@@ -33,7 +33,8 @@ interface BindingState {
 const TEXT = {
   zh: {
     sheet: '微信绑定',
-    desc: '用手机微信扫码，把这个微信号接到桌宠。只支持一对一私聊。',
+    desc: '用手机微信扫码接入一对一私聊。',
+    loading: '正在读取微信状态…',
     generate: '生成二维码',
     refresh: '重新生成',
     cancel: '取消扫码',
@@ -45,13 +46,12 @@ const TEXT = {
     verifyPlaceholder: '例如 123456',
     verifySubmit: '提交验证码',
     openLink: '二维码打不开？复制这个链接',
-    account: '已绑定',
-    unbound: '还没绑定微信。',
+    account: '账号',
+    unbound: '未绑定',
     binding: '等待扫码…',
     connected: '已连接',
     connecting: '连接中…',
     error: '连接异常',
-    tokenCount: (n: number) => `持有 ${n} 条会话令牌`,
     lastMessage: (at: string) => `最近一条微信消息：${at}`,
     noMessage: '还没收到过微信消息。',
     copy: '复制',
@@ -59,7 +59,8 @@ const TEXT = {
   },
   en: {
     sheet: 'WeChat binding',
-    desc: 'Scan with WeChat to bind this contact. One-to-one private chat only.',
+    desc: 'Scan with WeChat to connect a private chat.',
+    loading: 'Reading WeChat status…',
     generate: 'Show QR code',
     refresh: 'New QR code',
     cancel: 'Cancel',
@@ -71,13 +72,12 @@ const TEXT = {
     verifyPlaceholder: 'for example 123456',
     verifySubmit: 'Submit',
     openLink: 'QR code not opening? Copy this link',
-    account: 'Bound',
-    unbound: 'WeChat is not bound yet.',
+    account: 'Account',
+    unbound: 'Unbound',
     binding: 'Waiting for the scan…',
     connected: 'Connected',
     connecting: 'Connecting…',
     error: 'Connection error',
-    tokenCount: (n: number) => `${n} session token(s) held`,
     lastMessage: (at: string) => `Last WeChat message: ${at}`,
     noMessage: 'No WeChat message yet.',
     copy: 'Copy',
@@ -95,19 +95,27 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
   const t = text(ctx.language);
   const ui = ctx.ui;
 
-  const sheet = ui.sheet({ title: t.sheet, desc: t.desc });
+  const sheet = ui.sheet({ title: t.sheet });
+  sheet.el.classList.add('wechat-claw-console');
   ctx.root.append(sheet.el);
 
-  const stateLine = ui.msgline();
-  const whoLine = ui.msgline();
-  const tokenLine = ui.msgline();
-  const messageLine = ui.msgline();
+  const bindingRow = ui.h('div', 'wcc-binding-row');
+  const facts = ui.h('div', 'wcc-binding-facts');
+  const identity = ui.h('div', 'wcc-identity');
+  const stateLine = ui.pill(t.loading);
+  stateLine.setAttribute('role', 'status');
+  const whoLine = ui.h('span', 'wcc-account');
+  const messageLine = ui.h('div', 'wcc-detail', t.desc);
+  const errorLine = ui.msgline('', true);
+  errorLine.setAttribute('role', 'status');
+  errorLine.style.display = 'none';
+  identity.append(stateLine, whoLine);
+  facts.append(identity, messageLine);
 
   // 二维码区：有图时显示图，没图时留空。
   const qrBox = ui.h('div', 'qrbox');
   const qrImage = ui.h('img', 'qr');
   qrImage.alt = t.sheet;
-  qrImage.style.maxWidth = '280px';
   qrBox.append(qrImage);
   qrBox.style.display = 'none';
 
@@ -134,7 +142,9 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
   unbindButton.style.display = 'none';
   actions.append(generateButton, cancelButton, reconnectButton, unbindButton);
 
-  sheet.body.append(stateLine, whoLine, tokenLine, messageLine, qrBox, linkRow, verifyRow, actions);
+  bindingRow.append(facts, actions);
+  const services = ui.h('div', 'wcc-services');
+  sheet.body.append(bindingRow, errorLine, qrBox, linkRow, verifyRow, services);
 
   let currentState: BindingState = {
     bound: false,
@@ -145,10 +155,8 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
     lastMessageAt: '',
     lastMessageLocal: '',
     lastError: '',
-    contextTokens: 0,
     qrDataUrl: '',
     qrUrl: '',
-    loginStatus: '',
     loginError: '',
     verifyRequired: false,
   };
@@ -157,39 +165,25 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
     currentState = next;
 
     // 状态行：一句话说清现在能不能收消息。
-    const statusText = next.connected
-      ? t.connected
-      : next.loginStatus && next.loginStatus !== 'unbound' && next.status === 'binding'
-        ? t.binding
-        : next.bound
-          ? t.connecting
-          : next.lastError
-            ? t.error
-            : t.unbound;
-    stateLine.textContent = statusText;
-    stateLine.classList.toggle('bad', Boolean(next.lastError) && !next.connected);
+    const problem = next.loginError || (!next.connected ? next.lastError : '');
+    const statusText = next.connected ? t.connected
+      : problem ? t.error
+        : next.status === 'binding' ? t.binding
+          : next.bound ? t.connecting : t.unbound;
+    if (stateLine.textContent !== statusText) stateLine.textContent = statusText;
+    stateLine.classList.toggle('on', next.connected);
+    stateLine.classList.toggle('off', !next.connected && !next.loginError && !next.lastError);
 
     whoLine.textContent = next.bound
       ? `${t.account}：${shortId(next.userId || next.accountId)}`
       : '';
     whoLine.style.display = next.bound ? '' : 'none';
 
-    tokenLine.textContent = next.bound ? t.tokenCount(next.contextTokens) : '';
-    tokenLine.style.display = next.bound ? '' : 'none';
-
     // 用服务端给的本地时间；没有就退回原始值，但不截 UTC 钟点。
     const stamp = next.lastMessageLocal || (next.lastMessageAt ? next.lastMessageAt.replace('T', ' ').slice(0, 19) : '');
-    messageLine.textContent = stamp ? t.lastMessage(stamp) : (next.bound ? t.noMessage : '');
-    messageLine.style.display = next.bound ? '' : 'none';
-
-    // 错误：优先显示扫码期的具体原因。
-    if (next.loginError) {
-      stateLine.textContent = next.loginError;
-      stateLine.classList.add('bad');
-    } else if (next.lastError && !next.connected) {
-      stateLine.textContent = `${t.error}：${next.lastError}`;
-      stateLine.classList.add('bad');
-    }
+    messageLine.textContent = next.bound ? (stamp ? t.lastMessage(stamp) : t.noMessage) : t.desc;
+    if (errorLine.textContent !== problem) errorLine.textContent = problem;
+    errorLine.style.display = problem ? '' : 'none';
 
     const showQr = Boolean(next.qrDataUrl) && !next.bound;
     qrBox.style.display = showQr ? '' : 'none';
@@ -213,8 +207,10 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
     try {
       paint(await ctx.invoke<BindingState>('state'));
     } catch (err) {
-      stateLine.textContent = `${t.error}：${err instanceof Error ? err.message : String(err)}`;
-      stateLine.classList.add('bad');
+      stateLine.textContent = t.error;
+      stateLine.classList.remove('on', 'off');
+      errorLine.textContent = err instanceof Error ? err.message : String(err);
+      errorLine.style.display = '';
     }
   };
 
@@ -290,7 +286,7 @@ async function mountBinding(ctx: WebUiPanelContext): Promise<void> {
     void readState();
   }, 1000);
 
-  await readState();
+  await Promise.all([readState(), mountFfmpeg(ctx, services), mountTts(ctx, services)]);
 }
 
 function shortId(value: string): string {
@@ -303,7 +299,6 @@ function shortId(value: string): string {
 const bundle: WebUiClientBundle = {
   panels: {
     binding: { mount: mountBinding },
-    ffmpeg: { mount: mountFfmpeg },
   },
 };
 

@@ -155,32 +155,39 @@ function trimStopTail(piece: string): string {
  * 这里**只管语义**，不管单条长度上限：结果里某段仍超过微信的 4000 字时，
  * 由调用方交给 `splitText` 再切。
  */
-export function splitSegments(text: string): string[] {
+export function splitSegments(text: string, boundaries = text): string[] {
   const source = String(text ?? '');
-  const kind = pickKind(source);
+  const kind = pickKind(boundaries);
   if (!kind) {
     const only = source.trim();
     return only ? [only] : [];
   }
 
-  const cuts = findCuts(source, kind);
+  const cuts = findCuts(boundaries, kind);
   const parts: string[] = [];
   let cursor = 0;
 
   for (const cut of cuts) {
     // `keep` 为真时把分隔符留在前一段末尾（`！？…～` 的语气不能丢）。
-    let piece = source.slice(cursor, cut.keep ? cut.end : cut.start).trim();
+    const end = cut.keep ? cut.end : cut.start;
+    let piece = source.slice(cursor, end).trim();
     // 换行模式下，紧邻换行的句号落在段尾，按操作者要求一并去掉。
-    if (kind === 'newline') piece = trimStopTail(piece);
+    if (kind === 'newline') piece = trimUnprotectedTail(piece, boundaries.slice(cursor, end));
     if (piece) parts.push(piece);
     cursor = cut.end;
   }
 
   let tail = source.slice(cursor).trim();
-  if (kind === 'newline') tail = trimStopTail(tail);
+  if (kind === 'newline') tail = trimUnprotectedTail(tail, boundaries.slice(cursor));
   if (tail) parts.push(tail);
 
   return parts;
+}
+
+function trimUnprotectedTail(piece: string, boundaries: string): string {
+  const visible = boundaries.trimEnd();
+  const removed = visible.length - trimStopTail(visible).length;
+  return removed ? piece.slice(0, -removed).trimEnd() : piece;
 }
 
 /** 每条消息发送前的停顿；特长段视作未能断句，直接发送。 */

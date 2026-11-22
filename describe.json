@@ -2,15 +2,14 @@
   "tools": [
     {
       "name": "wechat_send",
-      "description": "Send a WeChat reply to the person whose inbound message arrived most recently. The channel is one-to-one and reply-only: a context token from that message must still be valid. Put the reply in one call when possible. Text, captions and media share the same reply allowance. Text longer than 4000 characters is split into consecutive messages, so write the whole reply at once.",
+      "description": "Reply to the bound WeChat user. Send the full reply in one call; text over 4000 characters is split automatically.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "text": {
             "type": "string",
-            "minLength": 1,
-            "description": "Reply text."
+            "minLength": 1
           }
         },
         "required": [
@@ -21,24 +20,24 @@
         "speak"
       ],
       "summary": {
-        "zh": "回复最近一条微信消息；只能发给刚发消息的人。",
-        "en": "Reply to the latest WeChat message; sends only to the person who just wrote."
+        "zh": "回复绑定的微信用户。",
+        "en": "Reply to the bound WeChat user."
       }
     },
     {
       "name": "wechat_send_image",
-      "description": "Send a picture to the person whose inbound message arrived most recently. Takes an absolute local file path inside the pet workspace (or the configured inbox); paths outside it are refused, so move a file into the workspace first. The file is uploaded to the WeChat CDN and delivered as a picture. A path whose content is not an image is delivered as a file instead, and the receipt says so. Optional caption is sent as a separate text message first.",
+      "description": "Reply with a local image.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "path": {
             "type": "string",
-            "description": "Absolute path of a local picture file inside the workspace."
+            "description": "Absolute image path in an allowed directory."
           },
           "caption": {
             "type": "string",
-            "description": "Optional text sent before the picture."
+            "description": "Separate text sent before the image."
           }
         },
         "required": [
@@ -55,18 +54,18 @@
     },
     {
       "name": "wechat_send_file",
-      "description": "Send a file attachment to the person whose inbound message arrived most recently. Takes an absolute local file path inside the pet workspace (or the configured inbox); paths outside it are refused, so move a file into the workspace first. The file is uploaded to the WeChat CDN and delivered as a downloadable file. Video files are delivered as videos, not as attachments. Optional caption is sent as a separate text message first.",
+      "description": "Reply with a local file. Videos and images use their native media types.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "path": {
             "type": "string",
-            "description": "Absolute path of a local file inside the workspace."
+            "description": "Absolute file path in an allowed directory."
           },
           "caption": {
             "type": "string",
-            "description": "Optional text sent before the file."
+            "description": "Separate text sent before the file."
           }
         },
         "required": [
@@ -82,8 +81,77 @@
       }
     },
     {
+      "name": "wechat_send_voice",
+      "description": "Reply with audio from a local path or a host blob. Sends MP3 by default.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Absolute WAV, MP3 or SILK v3 path in the workspace or inbox."
+          },
+          "blob": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Audio log:/mem: handle or its [blob ...] receipt line."
+          },
+          "fallback_text": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Text to send on audio failure. Defaults to a failure notice."
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "path"
+            ]
+          },
+          {
+            "required": [
+              "blob"
+            ]
+          }
+        ]
+      },
+      "tags": [
+        "speak"
+      ],
+      "summary": {
+        "zh": "发送本地音频或宿主音频附件，默认发 MP3 文件卡片。",
+        "en": "Send local audio or a host audio blob, as an MP3 attachment by default."
+      }
+    },
+    {
+      "name": "wechat_speak",
+      "description": "With TTS enabled, reply with synthesized speech. Falls back to the original text on audio failure.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "tags": [
+        "speak"
+      ],
+      "summary": {
+        "zh": "启用 TTS 时，将文字合成后发到微信，音频失败时补发原文。",
+        "en": "When TTS is enabled, synthesize and send audio to WeChat, with the original text as a fallback."
+      }
+    },
+    {
       "name": "wechat_status",
-      "description": "Report the WeChat ClawBot connection: bound account, whether the long poll is connected, the last inbound message time, the last error and how many context tokens are held. Also reports live model input support, receive switches and the last attachment delivery results. Pass mimes to check specific file types against the active Provider.",
+      "description": "Check WeChat connection, allowed send paths, active Provider input support and recent attachment results.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -95,7 +163,7 @@
               "type": "string",
               "minLength": 1
             },
-            "description": "Optional exact MIME types, such as audio/wav, video/mp4 or application/pdf."
+            "description": "Exact MIME types to check, e.g. audio/wav or application/pdf."
           }
         }
       },
@@ -104,32 +172,32 @@
         "snapshot"
       ],
       "summary": {
-        "zh": "查看微信连接、账号、最近消息与错误。",
-        "en": "Show the WeChat connection, account, last message and errors."
+        "zh": "查看连接、附件状态与模型输入能力。",
+        "en": "Check connection, attachments and model input support."
       }
     },
     {
       "name": "wechat_events",
-      "description": "Read archived WeChat events by kind and time. kind accepts * as a wildcard. Raw payloads never include context tokens.",
+      "description": "Read archived WeChat messages.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "kind": {
             "type": "string",
-            "description": "Event kind or glob, for example message/private."
+            "description": "Event kind or * glob, e.g. message/private."
           },
           "since": {
             "type": "string",
-            "description": "ISO 8601 lower bound, inclusive."
+            "description": "Inclusive ISO 8601 start."
           },
           "until": {
             "type": "string",
-            "description": "ISO 8601 upper bound, inclusive."
+            "description": "Inclusive ISO 8601 end."
           },
           "limit": {
             "type": "integer",
-            "description": "Maximum events to return, 1-100, default 30."
+            "description": "Up to 100 messages, default 30."
           }
         }
       },
@@ -164,7 +232,7 @@
       "key": "worlds.wechat-claw.envPrompt",
       "title": "微信 ClawBot · 环境提示词",
       "role": "envPrompt",
-      "content": "微信 ClawBot 是一条一对一私聊通道，接在微信里，只能回复刚发消息的那个人。\n\n## 手边的状态\n\n{{wechat.state | (微信还没接上。)}}\n{{wechat.account | (还没有绑定的微信号。)}}\n{{wechat.lastMessageAt | (还没有收到过微信消息。)}}\n{{wechat.lastError | (最近没有连接错误。)}}\n\n## 收到的东西在哪\n\n对方发来的图片、文件、视频、语音都落在你的工作区里：\n\n```\n{{wechat.inbox | (收件目录还没解析出来。)}}\n```\n\n它下面按类型分成 `images/`、`files/`、`videos/`、`voices/`，文件名保留对方给的原文名，后面接一个本地时间戳。\n这些文件就是普通文件——**读得到、改得了、也发得回去**。想让对方看到改过之后的版本，改完直接\n用 `wechat_send_file` 发那个路径就行。\n\n## 什么时候用\n\n微信里来人说话时，会收到一条 `wechat-claw.message`，正文以 `[微信 时间 发送者]` 开头，媒体路径就写在里面。要回话就用 `wechat_send`；图片用 `wechat_send_image`，其他文件用 `wechat_send_file`，两者都接本机绝对路径。\n\n- 对方发来图片时，图片会作为附件一起到达，路径也写在正文里。看不到附件时，按路径自行读取。\n  正文说「图片未附：体积…／尺寸…／超出数量上限」时，那张图是真的没交给你，**不要猜图里有什么**。\n- 对方发来文件时，路径写在正文里；当前 Provider 支持的图片、音乐、视频和文档会同时作为附件到达，需要本地内容时按路径读。\n- 对方发来视频时，当前 Provider 支持原生视频就直接附上视频；不支持时保留抽帧方式，把几帧**拼成一张图**附上，\n  正文写明布局（如「2列×2行，从左上到右下按时间顺序」）、原视频分辨率与每格尺寸。\n  按这个顺序理解画面；每格都很小，别去描述看不清的细节。正文说「视频帧未抽取」就是真的没看过。\n- 对方发来语音时，正文保留微信服务端转写。SILK 转为 WAV 后，Provider 接受 `audio/wav` 时一并附上。转码失败时保留原音频和转写，能否附上取决于 Provider 是否接受原格式。没有转写也没有可用附件时，不能猜说了什么。\n- 正文写明附件未附、下载失败或抽帧失败时，告诉对方具体原因；不要声称已听过或看过未提供的内容。模型请求被上游拒绝时，以 Core 报告的错误为准。\n- 想确认当前输入能力时，用 `wechat_status` 的 `mimes` 查询具体 MIME；它还报告接收开关和最近附件交给 Core 的结果。能力为真但没有附件时，检查是否未下载、超限或读取失败，不能把磁盘路径当作已发送的附件。\n\n## 能发什么\n\n只有你工作区里的文件能发到微信：\n\n```\n{{wechat.workspace | (工作区路径还没解析出来。)}}\n```\n\n收件目录在工作区里，所以收来的东西发得回去。工作区外面的路径会被直接拒绝——这不是故障，是边界：\n你的配置、密钥和这台机器的其他文件不在工作区的管辖范围内，不该被随手上传出去。\n\n要把工作区外的东西发出去，先把它复制进工作区（例如收件目录），再发复制之后那份。\n被拒绝时回执会列出允许的目录，照着调整路径就行，不要换个写法绕过它。\n\n## 约束\n\n这条通道只能回复最近发消息的人，不能主动找人，也不能发到别处。`wechat_send` 的回执会写明发给了谁。\n\n一条文本最多 4000 字，超出的部分会自动接着发成下一条，不必自己切。断行位置优先落在段落和句号上。\n\n## 分段发送\n\n这一段决定你说话的样子，值得花心思。\n\n打开分段发送时，你写的东西会被拆成好几条微信消息，一条一条发出去，条与条之间会停顿，让对方看着像你还在打字。\n\n拆的顺序按一次算，不会拆两次：\n\n- 你写了换行，就只按换行拆；换行会消失，段内不再按标点拆。紧挨换行的段尾句号也会被去掉，段内的句号留着。\n- 没写换行但有句号，就只按句号拆，句号会消失。\n- 都没写，但有 `！？…～` 或 `......` 这样的省略号，就按它们拆；连续符号只在整串末尾切一次，`~♡`、`……`、`!!!` 和尾随 emoji 都完整留着，换行前也保留省略号。\n- 都没有，就整条发出去。\n\n所以换行是你的节奏工具：**想让对方连看几行、想顿一下再说下一句，就写换行**。反过来，一句话里硬写换行会被拆成好几个气泡，看着像结巴。\n\n中文句号会被删掉，因为在微信里带句号显得生硬、像在写公文。这就是聊天里很少见句号的原因。别为了排版写句号。\n\n分段与间隔都是对方在配置页设的，你看不到也不必猜；照平时的习惯说话就行。\n\n语义段数达到配置阈值时，会恢复完整原文直接发送；超过 4000 字仍按微信上限分条。停顿按字数和「聊天节奏」计算，短句与断句失效的特长段直接发送。\n\n尽量把同一轮的回复写在一次 `wechat_send` 里。文字、附件和附件说明共用最近一条入站消息的回复额度。提示凭据停用或配额用尽时，等对方发来下一条消息再回复。若回执说明只发出了一部分，后续只补未发送的内容。\n\n这里发出的一切都会真的进到对方的微信里。不确定要不要发的时候，先问清楚。\n"
+      "content": "微信私聊（{{wechat.state | 状态未知}}）。入站事件为 `wechat-claw.message`，正文以 `[微信 …]` 开头。\n工作区：`{{wechat.workspace | 未知}}`。收件目录：`{{wechat.inbox | 未知}}`。\n\n- 用微信发送工具回复绑定用户，需有效的入站回复凭据。文字、媒体和说明共用额度，凭据失效或额度用尽时等对方再发消息。只补发未发出的内容，回执确认已补发的文字勿重发。\n- `wechat_send` 启用语义分段时，按换行、句号、语气标点的优先级择一切分，连续标点成组保留。\n- 发送本地文件用允许目录内的绝对路径。图片和文件可用工作区、收件目录或配置放行的目录。外发意图不明确时先确认。\n- 转发工具生成的音频时，将回执的句柄填入 `wechat_send_voice` 的 `blob`。\n- 正文提供本地媒体路径。以实际收到的附件、可读文件或微信语音转写为依据，按标注顺序看视频帧。缺少内容时说明已知原因，勿猜测；用 `wechat_status` 查输入能力和附件状态。\n"
     }
   ]
 }

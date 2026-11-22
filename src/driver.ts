@@ -192,6 +192,9 @@ export class ILinkDriver {
           this.#emit({ connected: true, expired: false, error: '', lastPollAtMs: this.lastPollAtMs });
         }
 
+        if (response?.msgs != null && !Array.isArray(response.msgs)) {
+          this.#log.warn('未识别的微信入站结构', { reason: 'invalid-updates-msgs', shape: typeof response.msgs });
+        }
         const messages = Array.isArray(response?.msgs) ? response.msgs : [];
         if (messages.length) {
           this.#log.info(`收到 ${messages.length} 条微信消息`);

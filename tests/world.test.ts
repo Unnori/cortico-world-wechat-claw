@@ -3,7 +3,7 @@
  *
  * 用真端口、真文件、真事件宿主；只有模型是假的（这里根本不调模型）。
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,13 +11,17 @@ import { randomBytes } from 'node:crypto';
 
 import type { EventEnvelope, PushOptions, ToolCallContext, WorldHost } from 'cortico/core/types.ts';
 import { coerceGroupValues, setByPath } from 'cortico/core/config-schema.ts';
+import { blobLine, LogBlobStore } from 'cortico/core/blobs.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 
 import { WECHAT_CLAW } from '../src/definition.ts';
-import { WECHAT_CLAW_CONFIG_GROUP, WECHAT_CLAW_DEFAULTS, type WechatClawConfigSection } from '../src/config.ts';
+import { wechatClawConfigGroups, WECHAT_CLAW_DEFAULTS, type WechatClawConfigSection } from '../src/config.ts';
 import { WechatClawWorld, EVENT_MESSAGE } from '../src/world.ts';
-import { encryptForTest, startFakeServer, type FakeServer, type FakeServerOptions } from './helpers/fake-server.ts';
+import { decryptForTest, encryptForTest, startFakeServer, type FakeServer, type FakeServerOptions } from './helpers/fake-server.ts';
 import { silkVoiceFixture } from './helpers/voice-fixture.ts';
+import { audioToMp3, isMp3 } from '../src/media/outbound-voice.ts';
+import { pcm16ToWav } from '../src/media/voice.ts';
+import { ttsSecretName } from '../src/media/tts.ts';
 
 /** 记录推送事件的假宿主；blob 与模型能力按需配置。 */
 class FakeHost implements WorldHost {
@@ -50,7 +54,7 @@ class FakeHost implements WorldHost {
     grep: () => [],
   } as unknown as WorldHost['store'];
 
-  blob = (): { bytes: Uint8Array; mime: string } | null => null;
+  blob: WorldHost['blob'] = () => null;
 
   modelFacts = {
     model: () => 'test-model',
@@ -72,6 +76,7 @@ function makeWorld(opts: {
   cfg: WechatClawConfigSection;
   dataDir: string;
   server: FakeServer;
+  ttsApiKey?: (name: string) => string;
 }): WechatClawWorld {
   return new WechatClawWorld({
     cfg: opts.cfg,
@@ -79,6 +84,8 @@ function makeWorld(opts: {
     botDir: opts.dataDir,
     dataDir: opts.dataDir,
     timezone: 'Asia/Shanghai',
+    ttsApiKey: opts.ttsApiKey,
+    persistTtsSettings: settings => { Object.assign(opts.cfg, settings); },
     endpoints: { apiBaseUrl: opts.server.baseUrl, cdnBaseUrl: opts.server.cdnBaseUrl },
   });
 }
@@ -123,6 +130,108 @@ describe('定义与声明', () => {
     expect(names.every((name) => name.startsWith('wechat_'))).toBe(true);
     const described = (WECHAT_CLAW.describe?.tools ?? []).map((tool) => tool.name);
     expect(described.sort()).toEqual(names.sort());
+  });
+
+  it('同一个 TTS 面板保存热配置和密钥，状态不含密钥值', async () => {
+    const secrets = new Map<string, string>();
+    const cfg = { ...WECHAT_CLAW_DEFAULTS };
+    const world = WECHAT_CLAW.create({
+      cfg,
+      botDir: scratchDir,
+      dataDir: scratchDir,
+      timezone: 'Asia/Shanghai',
+      secret: (name: string) => secrets.get(name) ?? '',
+      storeSecret: (name: string, value: string) => { secrets.set(name, value); },
+      persist: (settings: Partial<WechatClawConfigSection>) => { Object.assign(cfg, settings); },
+    } as never);
+    const invoke = world.webUi!('zh').invoke!;
+    expect(await invoke('binding', 'tts-state', [])).toMatchObject({ ttsEnabled: false, ttsSpeed: 1, keyConfigured: false });
+    const settings = { ttsEnabled: true, ttsBaseUrl: 'https://example.test/v1', ttsModel: 'speech', ttsVoice: 'alice', ttsSpeed: 1.25 };
+    const save = (patch: Record<string, unknown>) => Promise.resolve().then(() => invoke('binding', 'tts-save-settings', [patch]));
+    await expect(save({ ...settings, ttsSpeed: 9 })).rejects.toThrow(/语速/);
+    await expect(save({ ...settings, ttsBaseUrl: 'https://user:pass@example.test' })).rejects.toThrow(/凭据/);
+    expect(cfg.ttsEnabled).toBe(false);
+    expect(await save(settings)).toEqual({ ...settings, ttsProtocol: 'openai', keyConfigured: false });
+    expect(cfg).toMatchObject(settings);
+    expect(await invoke('binding', 'tts-save-key', ['  local-tts-key  '])).toEqual({ keyConfigured: true });
+    expect(secrets.get('WECHAT_CLAW_TTS_API_KEY')).toBe('local-tts-key');
+    expect(await invoke('binding', 'tts-state', [])).toEqual({ ...settings, ttsProtocol: 'openai', keyConfigured: true });
+    const firstAddress = 'http://127.0.0.1:9880';
+    const localState = (url: string) => invoke('binding', 'tts-key-state', ['gpt-sovits', url]);
+    expect(await localState(firstAddress)).toEqual({ keyConfigured: false });
+    await invoke('binding', 'tts-save-key', ['local-origin-key', 'gpt-sovits', firstAddress]);
+    expect(await localState('http://localhost:9880/audio/speech')).toEqual({ keyConfigured: true });
+    expect(await localState('http://127.0.0.1:9883')).toEqual({ keyConfigured: false });
+    expect(secrets.get('WECHAT_CLAW_TTS_API_KEY')).toBe('local-tts-key');
+    expect(JSON.stringify(cfg)).not.toMatch(/local-tts-key|local-origin-key/);
+    expect(world.webUi!('zh').config?.some(group => 'worlds.wechat-claw.ttsApiKey' in group.schema.properties)).toBe(false);
+  });
+
+  it('TTS 面板用尚未保存的地址获取硅基流动模型，只显示已确认的语音合成型号', async () => {
+    const cfg = { ...WECHAT_CLAW_DEFAULTS };
+    const world = new WechatClawWorld({
+      cfg, botDir: scratchDir, dataDir: scratchDir, timezone: 'Asia/Shanghai', ttsApiKey: () => 'catalog-key',
+    });
+    const fetchList = vi.fn().mockResolvedValue(Response.json({ data: [
+      { id: 'FunAudioLLM/CosyVoice2-0.5B' }, { id: 'fnlp/MOSS-TTSD-v0.5' }, { id: 'FunAudioLLM/SenseVoiceSmall' },
+      { id: 'Vendor/UnknownTTS' }, { id: 'FunAudioLLM/CosyVoice2-0.5B' }, null,
+    ] }));
+    const address = 'https://api.siliconflow.cn/v1/chat/completions';
+    vi.stubGlobal('fetch', fetchList);
+    try {
+      const invoke = world.webUi('zh').invoke!;
+      await expect(invoke('binding', 'tts-list-models', [address])).resolves.toEqual({ choices: [
+        { value: 'FunAudioLLM/CosyVoice2-0.5B', label: 'FunAudioLLM/CosyVoice2-0.5B' },
+        { value: 'fnlp/MOSS-TTSD-v0.5', label: 'fnlp/MOSS-TTSD-v0.5' },
+      ] });
+      const [url, options] = fetchList.mock.calls[0]!;
+      expect(url.href).toBe('https://api.siliconflow.cn/v1/models?type=audio');
+      expect(options).toMatchObject({ headers: { Authorization: 'Bearer catalog-key' }, redirect: 'error' });
+      expect(cfg.ttsBaseUrl).toBe('');
+      await expect(invoke('binding', 'tts-list-models', ['https://api.siliconflow.cn.example.test/v1'])).rejects.toThrow(/手动填写/);
+      expect(fetchList).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('TTS 面板合并所选模型的预置与账号音色，自定义查询失败时仍提供预置音色', async () => {
+    const world = new WechatClawWorld({
+      cfg: { ...WECHAT_CLAW_DEFAULTS }, botDir: scratchDir, dataDir: scratchDir, timezone: 'Asia/Shanghai',
+      ttsApiKey: () => 'catalog-key',
+    });
+    const model = 'FunAudioLLM/CosyVoice2-0.5B';
+    const uri = 'speech:my-voice:abc:def';
+    const fetchList = vi.fn()
+      .mockResolvedValueOnce(Response.json({ results: [
+        { model, uri, customName: '我的音色', text: '不应出现在界面响应中的参考音频转写' },
+        { model: 'fnlp/MOSS-TTSD-v0.5', uri: 'speech:other:abc:def', customName: '其他模型' },
+        { model, uri, customName: '重复' },
+      ] }))
+      .mockResolvedValueOnce(new Response(null, { status: 401 }));
+    vi.stubGlobal('fetch', fetchList);
+    try {
+      const invoke = world.webUi('zh').invoke!;
+      const args = ['https://api.siliconflow.cn/v1/audio/speech', model];
+      const result = await invoke('binding', 'tts-list-voices', args) as { choices: unknown[] };
+      expect(fetchList.mock.calls[0]![0].href).toBe('https://api.siliconflow.cn/v1/audio/voice/list');
+      expect(result.choices).toHaveLength(9);
+      expect(result.choices).toContainEqual({ value: model + ':anna', label: 'anna', source: 'preset' });
+      expect(result.choices.at(-1)).toEqual({ value: uri, label: '我的音色', source: 'custom' });
+      await expect(invoke('binding', 'tts-list-voices', args)).resolves.toMatchObject({
+        choices: result.choices.slice(0, 8), note: expect.stringContaining('HTTP 401'),
+      });
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('通用配置按用途分组，TTS 字段只在专用面板出现', () => {
+    const groups = wechatClawConfigGroups('zh');
+    expect(groups.map(group => group.schema.title)).toEqual([
+      '消息投递与回复', '附件收发', '图片与视频', '微信网络',
+    ]);
+    expect(groups.every(group => group.owner === 'world:wechat-claw')).toBe(true);
+    const paths = groups.flatMap(group => Object.keys(group.schema.properties));
+    expect(paths.sort()).toEqual(Object.keys(WECHAT_CLAW_DEFAULTS).filter(key => key !== 'enabled' && !key.startsWith('tts'))
+      .map(key => 'worlds.wechat-claw.' + key).sort());
+    expect(wechatClawConfigGroups('en').map(group => group.id)).toEqual(groups.map(group => group.id));
   });
 
   it('环境提示词里的占位符都有值，渲染后不残留', async () => {
@@ -218,7 +327,7 @@ describe('入站消息', () => {
   /** 起一个已绑定的 World，并把一条消息推进队列，等它落到事件里。 */
   async function receive(
     message: Record<string, unknown>,
-    opts: { cfg?: Partial<WechatClawConfigSection>; acceptImages?: boolean } = {},
+    opts: { cfg?: Partial<WechatClawConfigSection>; acceptImages?: boolean; onWarn?: FakeHost['log']['warn'] } = {},
   ): Promise<{ world: WechatClawWorld; host: FakeHost; server: FakeServer; cfg: WechatClawConfigSection }> {
     const srv = await startFakeServer();
     server = srv;
@@ -238,6 +347,7 @@ describe('入站消息', () => {
     writeFileSync(join(authDir, 'context-tokens.json'), JSON.stringify({ 'wx-user@im.wechat': 'ctx-1' }));
 
     const host = new FakeHost();
+    if (opts.onWarn) host.log.warn = opts.onWarn;
     host.acceptImages = opts.acceptImages ?? true;
     await world.start(host);
 
@@ -247,9 +357,33 @@ describe('入站消息', () => {
     return { world, host, server: srv, cfg };
   }
 
+  it('按已知字段恢复未知枚举的语音转文字，脱敏日志不含原文或令牌', async () => {
+    const warns: unknown[] = [];
+    const { world, host, server: srv } = await receive({
+      from_user_id: 'wx-user@im.wechat', message_type: 1, item_list: [
+        { type: 42, text_item: { text: 'dictation-private' } },
+        { voice_item: { text: 'transcript-private' } },
+        { type: 'secret-type-value', 'secret-field-name': 'secret-content-value' },
+      ],
+    }, { cfg: { inboundTrigger: 'preempt' }, onWarn: (message, attrs) => warns.push({ message, attrs }) });
+    try {
+      const index = host.events.findIndex(event => event.type === EVENT_MESSAGE);
+      expect(host.events[index]?.text).toContain('dictation-private');
+      expect(host.events[index]?.text).toContain('[语音转写] transcript-private');
+      expect(host.pushOptions[index]?.trigger).toBe('preempt');
+      srv.queue.push({ message_type: 1, context_token: 'envelope-credential', item_list: [] });
+      await waitFor(() => JSON.stringify(warns).includes('missing-sender'), 5000);
+      const log = JSON.stringify(warns);
+      expect(log).toContain('"type":42');
+      expect(log).toContain('text_item');
+      expect(log).toContain('unsupported-item-type');
+      expect(log).not.toMatch(/ctx-2|envelope-credential|wx-user|private|secret/);
+    } finally { await world.stop(); }
+  });
+
   it('投递方式经宿主配置校验后热生效，旧配置和未知值沿用合批', async () => {
     const path = 'worlds.wechat-claw.inboundTrigger';
-    const group = WECHAT_CLAW_CONFIG_GROUP;
+    const group = wechatClawConfigGroups('zh')[0]!;
     const property = group.schema.properties[path];
     expect(property['x-hot']).toBe(true);
     const options = WECHAT_CLAW.configOptions!(property['x-options']!, 'zh');
@@ -467,26 +601,26 @@ describe('入站消息', () => {
 
     // 面板状态能读到：没装、不可用、也没在装。
     const invoke = world.webUi('zh').invoke!;
-    const state = await invoke('ffmpeg', 'state', []) as Record<string, unknown>;
+    const state = await invoke('binding', 'ffmpeg-state', []) as Record<string, unknown>;
     expect(state.installed).toBe(false);
     expect(state.installing).toBe(false);
     expect(state.ready).toBe(false);
     await world.stop();
   });
 
-  it('ffmpeg 面板声明在 webUi 里，且能取消没有进行中的下载', async () => {
+  it('FFmpeg 和 TTS 嵌入连接面板，FFmpeg 仍能取消下载', async () => {
     const srv = await startFakeServer();
     server = srv;
     const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
     const decl = world.webUi('zh');
-    expect(decl.panels?.map((p) => p.id).sort()).toEqual(['binding', 'ffmpeg']);
-    const ffmpegPanel = decl.panels!.find((p) => p.id === 'ffmpeg')!;
-    expect(ffmpegPanel.getMethods).toContain('state');
+    expect(decl.panels).toEqual([
+      { id: 'binding', title: '连接与工具', getMethods: ['state', 'ffmpeg-state', 'tts-state'] },
+    ]);
 
     const host = new FakeHost();
     await world.start(host);
     const invoke = world.webUi('zh').invoke!;
-    const result = await invoke('ffmpeg', 'cancel', []) as Record<string, unknown>;
+    const result = await invoke('binding', 'ffmpeg-cancel', []) as Record<string, unknown>;
     expect(result.cancelled).toBe(false);
     await world.stop();
   });
@@ -683,9 +817,9 @@ describe('入站消息', () => {
   });
 });
 
-describe('分段发送', () => {
+describe('出站发送与配额', () => {
   /** 绑定凭据并把 World 跑起来。 */
-  async function ready(cfg: Partial<WechatClawConfigSection> = {}, serverOptions: FakeServerOptions = {}) {
+  async function ready(cfg: Partial<WechatClawConfigSection> = {}, serverOptions: FakeServerOptions = {}, ttsApiKey?: (name: string) => string) {
     const srv = await startFakeServer({ maxRepliesPerContext: 10, ...serverOptions });
     server = srv;
     const authDir = join(scratchDir, 'wechat-claw');
@@ -695,16 +829,280 @@ describe('分段发送', () => {
       userId: 'wx-user@im.wechat', savedAt: new Date().toISOString(),
     }));
     writeFileSync(join(authDir, 'context-tokens.json'), JSON.stringify({ 'wx-user@im.wechat': 'ctx-1' }));
-    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS, ...cfg }, dataDir: scratchDir, server: srv });
+    const config = { ...WECHAT_CLAW_DEFAULTS, ...cfg };
+    const world = makeWorld({ cfg: config, dataDir: scratchDir, server: srv, ttsApiKey });
     const host = new FakeHost();
     await world.start(host);
     const send = world.tools().find((tool) => tool.name === 'wechat_send')!;
-    return { srv, world, host, send };
+    return { srv, world, host, send, config };
   }
 
   /** 假服务端收到的文本正文。 */
   const texts = (srv: FakeServer): string[] =>
     srv.sent.map((msg) => String((msg.item_list as Array<{ text_item?: { text?: string } }>)[0]?.text_item?.text ?? ''));
+
+  async function audioFile(world: WechatClawWorld, name: string, bytes: Buffer): Promise<string> {
+    const status = world.tools().find(t => t.name === 'wechat_status')!;
+    const workspace = JSON.parse(String(await status.handler({}, call))).workspace;
+    mkdirSync(workspace, { recursive: true });
+    const path = join(workspace, name);
+    writeFileSync(path, bytes);
+    return path;
+  }
+
+  it('公式和列表在实际发送前清洗，每条续文都随对应标题发出', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 0 });
+    try {
+      await send.handler({ text: '1. **计算**\n    $x^2$\n2. **最后一点**\n    正文。' }, call);
+      expect(texts(srv)).toEqual(['1. **计算**：x²', '2. **最后一点**：正文']);
+    } finally { await world.stop(); }
+  });
+
+  it('开启原生语音后走 SILK 协议，工作区外拒绝，且与文本共用配额', async () => {
+    const { srv, world, send } = await ready({ nativeVoiceEnabled: true, segmentPace: 0, sendExtraDirs: 'extra' });
+    const tool = world.tools().find(t => t.name === 'wechat_send_voice')!;
+    const status = world.tools().find(t => t.name === 'wechat_status')!;
+    const workspace = JSON.parse(String(await status.handler({}, call))).workspace;
+    mkdirSync(workspace, { recursive: true });
+    const path = join(workspace, 'fixture.wav');
+    const wav = pcm16ToWav(Buffer.alloc(4800), 24_000, 1);
+    writeFileSync(path, wav);
+    const extra = join(scratchDir, 'extra');
+    mkdirSync(extra);
+    const outside = join(extra, 'fixture.wav');
+    writeFileSync(outside, wav);
+    try {
+      await expect(tool.handler({ path: outside }, call)).rejects.toThrow(/不在工作区/);
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      await send.handler({ text: '八\n九' }, call);
+      expect(await tool.handler({ path }, call)).toContain('已接收发给');
+      expect(srv.sent).toHaveLength(10);
+      expect(srv.sent.at(-1)).toMatchObject({
+        context_token: 'ctx-1',
+        item_list: [{ type: 3, voice_item: {
+          encode_type: 6, sample_rate: 24_000, bits_per_sample: 16, playtime: 100,
+          media: { encrypt_query_param: expect.any(String), aes_key: expect.any(String), encrypt_type: 1 },
+        } }],
+      });
+      const uploadRequest = srv.requests.find(r => r.path.endsWith('/getuploadurl'))!;
+      expect(JSON.parse(uploadRequest.body).media_type).toBe(4);
+      const [{ ciphertext, key }] = Array.from(srv.uploads.values());
+      expect(decryptForTest(ciphertext, key).subarray(0, 10)).toEqual(Buffer.from('\x02#!SILK_V3'));
+      await expect(send.handler({ text: '配额已满' }, call)).rejects.toThrow(/配额已用尽/);
+    } finally { await world.stop(); }
+  });
+
+  it('默认只走文件通道，MP3 原样发送，文件卡片引用 CDN 响应头', async () => {
+    const { srv, world, config } = await ready({}, { uploadParamOnly: true });
+    const mp3 = await audioToMp3(pcm16ToWav(Buffer.alloc(4800), 24_000, 1), 100_000);
+    const path = await audioFile(world, 'audio.mp3', mp3);
+    const voice = world.tools().find(t => t.name === 'wechat_send_voice')!;
+    try {
+      const group = wechatClawConfigGroups('zh').find(group => group.id === 'world:wechat-claw');
+      expect(group?.schema.properties['worlds.wechat-claw.nativeVoiceEnabled']['x-hot']).toBe(true);
+      expect(config.nativeVoiceEnabled).toBe(false);
+      expect(await voice.handler({ path }, call)).toContain('MP3 音频文件');
+      const requests = () => srv.requests.filter(r => r.path.endsWith('/getuploadurl')).map(r => JSON.parse(r.body));
+      const [fileUpload] = requests();
+      expect(requests().map(r => r.media_type)).toEqual([3]);
+      expect(srv.sent[0]).toMatchObject({ item_list: [{ type: 4, file_item: {
+        file_name: 'audio.mp3', media: { encrypt_query_param: 'download-param-' + fileUpload.filekey },
+      } }] });
+      const uploaded = srv.uploads.get(fileUpload.filekey)!;
+      expect(decryptForTest(uploaded.ciphertext, uploaded.key)).toEqual(mp3);
+
+      config.nativeVoiceEnabled = true;
+      expect(await voice.handler({ path }, call)).toContain('原生语音');
+      expect(requests().map(r => r.media_type)).toEqual([3, 4]);
+      expect(srv.sent[1]).toMatchObject({ item_list: [{ type: 3 }] });
+    } finally { await world.stop(); }
+  });
+
+  it('通过宿主发送回执中的 log 音频和 mem 音频，与文本共用回复额度', async () => {
+    const { srv, world, host, send, config } = await ready({ segmentPace: 0 });
+    const wav = pcm16ToWav(Buffer.alloc(4800), 24_000, 1);
+    const log = new LogBlobStore(scratchDir);
+    const logHandle = log.put(wav, 'audio/wav');
+    const memHandle = 'mem:speech/my voice.wav';
+    const resolveBlob = vi.fn((handle: string) => handle === memHandle ? { bytes: wav, mime: 'audio/wav' } : log.read(handle));
+    host.blob = resolveBlob;
+    const voice = world.tools().find(t => t.name === 'wechat_send_voice')!;
+    try {
+      const receipt = blobLine({ handle: logHandle, mime: 'audio/wav', name: 'sovits output.wav', fallbackText: '已静默合成' });
+      expect(await voice.handler({ blob: receipt }, call)).toContain('MP3 音频文件');
+      expect(resolveBlob).toHaveBeenNthCalledWith(1, logHandle);
+      expect(srv.sent[0]).toMatchObject({
+        context_token: 'ctx-1', item_list: [{ type: 4, file_item: { file_name: '语音回复.mp3' } }],
+      });
+      const [{ ciphertext, key }] = Array.from(srv.uploads.values());
+      expect(isMp3(decryptForTest(ciphertext, key))).toBe(true);
+
+      config.nativeVoiceEnabled = true;
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      await send.handler({ text: '八' }, call);
+      expect(await voice.handler({ blob: memHandle }, call)).toContain('原生语音');
+      expect(resolveBlob).toHaveBeenNthCalledWith(2, memHandle);
+      expect(srv.sent.at(-1)).toMatchObject({ context_token: 'ctx-1', item_list: [{ type: 3 }] });
+      expect(srv.sent).toHaveLength(10);
+      await expect(voice.handler({ blob: logHandle }, call)).rejects.toThrow(/配额已用尽/);
+      expect(resolveBlob).toHaveBeenCalledTimes(2);
+    } finally { await world.stop(); }
+  });
+
+  it('失效、非音频和超限的句柄不上传，也不占微信回复额度', async () => {
+    const { srv, world, host } = await ready({ maxInboundMediaMb: 1 });
+    const log = new LogBlobStore(scratchDir);
+    const pdf = log.put(Buffer.from('%PDF-1.4'), 'application/pdf');
+    host.blob = handle => handle === 'mem:large.wav'
+      ? { bytes: new Uint8Array(1_048_577), mime: 'audio/wav' }
+      : log.read(handle);
+    const voice = world.tools().find(t => t.name === 'wechat_send_voice')!;
+    try {
+      await expect(voice.handler({}, call)).rejects.toThrow(/path 或 blob/);
+      await expect(voice.handler({ blob: pdf, path: join(scratchDir, 'x.wav') }, call)).rejects.toThrow(/path 或 blob/);
+      await expect(voice.handler({ blob: 'log:00abcde1.wav' }, call)).rejects.toThrow(/找不到该音频附件/);
+      await expect(voice.handler({ blob: pdf }, call)).rejects.toThrow(/不是音频/);
+      await expect(voice.handler({ blob: 'mem:large.wav' }, call)).rejects.toThrow(/超过单条媒体大小上限/);
+      await expect(voice.handler({ blob: 'https://example.test/x.wav' }, call)).rejects.toThrow(/须为 log:/);
+      expect(srv.sent).toHaveLength(0);
+      expect(srv.requests.some(r => r.path.endsWith('/getuploadurl'))).toBe(false);
+    } finally { await world.stop(); }
+  });
+
+  it('CDN 缺少 x-encrypted-param 时补发文字，禁止用 upload_param 构造文件消息', async () => {
+    const { srv, world } = await ready({}, { uploadParamOnly: true, missingUploadHeader: true });
+    const path = await audioFile(world, 'audio.wav', pcm16ToWav(Buffer.alloc(4800), 24_000, 1));
+    const voice = world.tools().find(t => t.name === 'wechat_send_voice')!;
+    try {
+      expect(await voice.handler({ path, fallback_text: '改由文字说明' }, call)).toContain('补发文字');
+      expect(texts(srv)).toEqual(['改由文字说明']);
+      expect(srv.requests.filter(r => r.path.endsWith('/sendmessage'))).toHaveLength(1);
+      expect(srv.uploads.size).toBe(1);
+    } finally { await world.stop(); }
+  });
+
+  it('MP3 文件被明确拒绝后补发提示，占最后一条回复额度', async () => {
+    const { srv, world, send } = await ready({ segmentPace: 0 });
+    const path = await audioFile(world, 'audio.wav', pcm16ToWav(Buffer.alloc(4800), 24_000, 1));
+    const voice = world.tools().find(t => t.name === 'wechat_send_voice')!;
+    try {
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      await send.handler({ text: '八\n九' }, call);
+      srv.nextSendRet = 2;
+      expect(await voice.handler({ path }, call)).toContain('补发文字');
+      expect(texts(srv).at(-1)).toBe('这段音频未能发出。');
+      expect(srv.sent).toHaveLength(10);
+      await expect(send.handler({ text: '第十一条' }, call)).rejects.toThrow(/配额已用尽/);
+    } finally { await world.stop(); }
+  });
+
+  it.each(['upload', 'send'] as const)('原生语音在 %s 阶段失败时走 MP3 文件，只计成功回复', async (voiceFailure) => {
+    const { srv, world, send } = await ready({ segmentPace: 0, nativeVoiceEnabled: true }, { voiceFailure });
+    const tool = world.tools().find(t => t.name === 'wechat_send_voice')!;
+    const workspace = JSON.parse(String(await world.tools().find(t => t.name === 'wechat_status')!.handler({}, call))).workspace;
+    const path = join(workspace, 'voice.wav');
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(path, pcm16ToWav(Buffer.alloc(4800), 24_000, 1));
+    try {
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      await send.handler({ text: '八' }, call);
+      await send.handler({ text: '九' }, call);
+      expect(await tool.handler({ path }, call)).toContain('已改发 MP3 音频文件');
+      expect(srv.requests.filter(r => r.path.endsWith('/getuploadurl')).map(r => JSON.parse(r.body).media_type)).toEqual([4, 3]);
+      expect(srv.sent).toHaveLength(10);
+      expect(srv.sent.at(-1)).toMatchObject({ context_token: 'ctx-1', item_list: [{ type: 4, file_item: { file_name: 'voice.mp3' } }] });
+      const uploaded = Array.from(srv.uploads.values()).at(-1)!;
+      expect(isMp3(decryptForTest(uploaded.ciphertext, uploaded.key))).toBe(true);
+      await expect(send.handler({ text: '第十一条' }, call)).rejects.toThrow(/配额已用尽/);
+    } finally { await world.stop(); }
+  });
+
+  it('发送响应不确定时只尝试一次原生语音', async () => {
+    const { srv, world } = await ready({ nativeVoiceEnabled: true }, { voiceFailure: 'ambiguous' });
+    const workspace = JSON.parse(String(await world.tools().find(t => t.name === 'wechat_status')!.handler({}, call))).workspace;
+    const path = join(workspace, 'voice.wav');
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(path, pcm16ToWav(Buffer.alloc(4800), 24_000, 1));
+    try {
+      const voice = world.tools().find(t => t.name === 'wechat_send_voice')!;
+      await expect(voice.handler({ path }, call)).rejects.toThrow(/HTTP 502/);
+      expect(srv.requests.filter(r => r.path.endsWith('/getuploadurl'))).toHaveLength(1);
+      expect(srv.requests.filter(r => r.path.endsWith('/sendmessage'))).toHaveLength(1);
+    } finally { await world.stop(); }
+  });
+
+  it('TTS 默认关闭，启用后按 OpenAI 协议合成，发送成功和失败都清理临时目录', async () => {
+    const mp3 = await audioToMp3(pcm16ToWav(Buffer.alloc(4800), 24_000, 1), 100_000);
+    const { srv, world } = await ready({}, { speechMp3: mp3, maxRepliesPerContext: 1 }, () => 'fake-tts-key');
+    const tool = world.tools().find(t => t.name === 'wechat_speak')!;
+    const speechRequests = () => srv.requests.filter(r => r.path === '/v1/audio/speech');
+    const tempDirs = () => readdirSync(join(scratchDir, 'wechat-claw')).filter(name => name.startsWith('tts-'));
+    try {
+      await expect(tool.handler({ text: '你好' }, call)).rejects.toThrow(/未启用/);
+      expect(speechRequests()).toHaveLength(0);
+      await world.webUi('zh').invoke!('binding', 'tts-save-settings', [{
+        ttsEnabled: true, ttsBaseUrl: srv.baseUrl + '/v1/chat/completions', ttsModel: 'test-model', ttsVoice: 'test-voice', ttsSpeed: 1.25,
+      }]);
+      expect(await tool.handler({ text: '你好' }, call)).toContain('MP3 音频文件');
+      expect(speechRequests()).toHaveLength(1);
+      expect(speechRequests()[0]!.headers.authorization).toBe('Bearer fake-tts-key');
+      expect(JSON.parse(speechRequests()[0]!.body)).toEqual({
+        input: '你好', model: 'test-model', voice: 'test-voice', speed: 1.25, response_format: 'mp3',
+      });
+      expect(tempDirs()).toEqual([]);
+      expect(srv.sent[0]).toMatchObject({ item_list: [{ type: 4, file_item: { file_name: '语音回复.mp3' } }] });
+      await expect(tool.handler({ text: '失败时也要清理' }, call)).rejects.toThrow(/已发 0\/1 条/);
+      expect(tempDirs()).toEqual([]);
+      await expect(tool.handler({ text: '凭据失效后不再合成' }, call)).rejects.toThrow(/回复凭据已停用/);
+      expect(speechRequests()).toHaveLength(2);
+      expect(srv.requests.filter(r => r.path.endsWith('/getuploadurl')).map(r => JSON.parse(r.body).media_type)).toEqual([3, 3]);
+      expect(srv.requests.filter(r => r.path.endsWith('/sendmessage'))).toHaveLength(2);
+    } finally { await world.stop(); }
+  });
+
+  it('GPT-SoVITS 按当前服务音色合成 WAV，再作为微信 MP3 文件发送', async () => {
+    const wav = pcm16ToWav(Buffer.alloc(4_800), 24_000, 1);
+    const { srv, world } = await ready({}, { speechWav: wav }, name =>
+      name === 'WECHAT_CLAW_TTS_API_KEY' ? 'cloud-tts-key' :
+      name === ttsSecretName('gpt-sovits', srv.baseUrl) ? 'local-token' : '');
+    try {
+      const invoke = world.webUi('zh').invoke!;
+      await invoke('binding', 'tts-save-settings', [{
+        ttsEnabled: true, ttsProtocol: 'gpt-sovits', ttsBaseUrl: srv.baseUrl, ttsModel: 'gpt-sovits', ttsVoice: '', ttsSpeed: 1,
+      }]);
+      const tool = world.tools().find(t => t.name === 'wechat_speak')!;
+      expect(await tool.handler({ text: '本地合成' }, call)).toContain('MP3 音频文件');
+      const speech = srv.requests.find(r => r.path === '/audio/speech');
+      expect(speech?.headers.authorization).toBe('Bearer local-token');
+      expect(JSON.parse(speech!.body)).toEqual({ input: '本地合成', model: 'gpt-sovits', speed: 1 });
+      expect(srv.sent[0]).toMatchObject({ item_list: [{ type: 4, file_item: { file_name: '语音回复.mp3' } }] });
+    } finally { await world.stop(); }
+  });
+
+  it('TTS 合成失败时补发原文，无音频上传', async () => {
+    const { srv, world, config } = await ready({ ttsEnabled: true, ttsModel: 'test', ttsVoice: 'test' });
+    config.ttsBaseUrl = srv.baseUrl;
+    const tool = world.tools().find(t => t.name === 'wechat_speak')!;
+    try {
+      expect(await tool.handler({ text: '把这句原文发出去。' }, call)).toContain('补发文字');
+      expect(texts(srv)).toEqual(['把这句原文发出去。']);
+      expect(srv.requests.some(r => r.path.endsWith('/audio/speech'))).toBe(true);
+      expect(srv.requests.some(r => r.path.endsWith('/getuploadurl'))).toBe(false);
+    } finally { await world.stop(); }
+  });
+
+  it('补发原文只剩一条额度时，发送 4000 字以内的文字并提示截短', async () => {
+    const { srv, world, send, config } = await ready({ ttsEnabled: true, ttsModel: 'test', ttsVoice: 'test', segmentPace: 0 });
+    config.ttsBaseUrl = srv.baseUrl;
+    const tool = world.tools().find(t => t.name === 'wechat_speak')!;
+    try {
+      await send.handler({ text: '一\n二\n三\n四\n五\n六\n七' }, call);
+      await send.handler({ text: '八\n九' }, call);
+      expect(await tool.handler({ text: '字'.repeat(4096) }, call)).toContain('已截短');
+      expect(texts(srv).at(-1)).toBe('字'.repeat(3999) + '…');
+      expect(srv.sent).toHaveLength(10);
+    } finally { await world.stop(); }
+  });
 
   it.each([[12, 11], [0, 10], [8, 8]])('配置 %i 时，%i 段已恢复完整原文，仍可补一句', async (threshold, count) => {
     const { srv, world, send } = await ready({ segmentMaxParts: threshold, segmentPace: 0 });

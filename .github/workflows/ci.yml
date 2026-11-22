@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@v6
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Node and WebUI types
+        run: |
+          pnpm typecheck
+          pnpm exec tsc -p tsconfig.web.json --noEmit
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build WebUI
+        run: pnpm build
+
+      - name: Pack and check npm archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm-package"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/npm-package" > "$RUNNER_TEMP/pack.json"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          const report = JSON.parse(readFileSync(join(process.env.RUNNER_TEMP, 'pack.json'), 'utf8'));
+          const pack = Array.isArray(report) ? report[0] : report[pkg.name];
+          assert.equal(pack.id, `${pkg.name}@${pkg.version}`);
+          const files = new Map(pack.files.map(({ path, size }) => [path, size]));
+          const { icon, describe, webUiClient, webUiStyle } = pkg.cortico;
+          for (const path of [pkg.main, icon, describe, webUiClient, webUiStyle]) {
+            assert(files.get(path.replace(/^\.\//, '')) > 0, `Missing or empty package file: ${path}`);
+          }
+          console.log(`Verified ${pack.filename}: ${files.size} files, ${pack.size} bytes`);
+          NODE
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package/*.tgz
+          if-no-files-found: error
+          overwrite: true

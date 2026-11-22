@@ -29,6 +29,11 @@ export interface FakeMessage {
 }
 
 export interface FakeServerOptions {
+  speechMp3?: Buffer;
+  speechWav?: Buffer;
+  voiceFailure?: 'upload' | 'send' | 'ambiguous';
+  uploadParamOnly?: boolean;
+  missingUploadHeader?: boolean;
   /** 每个 context_token 允许成功发送的条数。 */
   maxRepliesPerContext?: number;
   beforeSend?: (message: Record<string, unknown>) => Promise<void>;
@@ -98,13 +103,28 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     const body = rawBody.toString('utf8');
     requests.push({ method: req.method ?? 'GET', path: url.pathname, headers: req.headers, body });
 
+    if (url.pathname === '/audio/speech' && opts.speechWav) {
+      res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': opts.speechWav.length });
+      res.end(opts.speechWav);
+      return;
+    }
+    if (url.pathname === '/v1/audio/speech' && opts.speechMp3) {
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': opts.speechMp3.length });
+      res.end(opts.speechMp3);
+      return;
+    }
+
     // ---- CDN ----
     if (url.pathname === '/cdn/upload') {
+      if (opts.uploadParamOnly && url.searchParams.get('encrypted_query_param') !== 'upload-param') {
+        sendJson(res, { error: 'incorrect upload parameter' }, 400);
+        return;
+      }
       // 客户端拼的地址是 /upload?encrypted_query_param=...&filekey=...，filekey 在查询串里。
       const filekey = url.searchParams.get('filekey') ?? 'no-filekey';
       const key = uploadKey ?? randomBytes(16);
       uploads.set(filekey, { ciphertext: rawBody, key });
-      res.writeHead(200, { 'x-encrypted-param': `download-param-${filekey}` });
+      res.writeHead(200, opts.missingUploadHeader ? {} : { 'x-encrypted-param': `download-param-${filekey}` });
       res.end();
       return;
     }
@@ -172,15 +192,28 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
         sendJson(res, { ret: -2, errmsg: 'prepare failed' });
         return;
       }
+      const item = (message.item_list as Array<{ type?: number }> | undefined)?.[0];
+      if (item?.type === 3 && opts.voiceFailure === 'send') {
+        sendJson(res, { ret: 2, errmsg: 'voice message unsupported' });
+        return;
+      }
       sent.push(message);
+      if (item?.type === 3 && opts.voiceFailure === 'ambiguous') {
+        sendJson(res, { error: 'response lost' }, 502);
+        return;
+      }
       sendJson(res, { ret: 0, message_id: '9007199254740993' });
       return;
     }
     if (url.pathname === '/ilink/bot/getuploadurl') {
-      const parsed = JSON.parse(body) as { aeskey?: string; filekey?: string };
+      const parsed = JSON.parse(body) as { aeskey?: string; filekey?: string; media_type?: number };
+      if (parsed.media_type === 4 && opts.voiceFailure === 'upload') {
+        sendJson(res, { ret: 2, errmsg: 'voice upload unsupported' });
+        return;
+      }
       uploadKey = Buffer.from(String(parsed.aeskey ?? ''), 'hex');
       sendJson(res, {
-        upload_full_url: `${state.cdnBaseUrl}/upload?filekey=${encodeURIComponent(String(parsed.filekey ?? ''))}`,
+        ...(!opts.uploadParamOnly && { upload_full_url: `${state.cdnBaseUrl}/upload?filekey=${encodeURIComponent(String(parsed.filekey ?? ''))}` }),
         upload_param: 'upload-param',
       });
       return;

@@ -6,8 +6,8 @@ import { EVENT_LINK, EVENT_MESSAGE, WECHAT_CLAW_TOOL_DECLS, WechatClawWorld } fr
 
 const TOOL_SUMMARIES: Record<string, DescribeText> = {
   wechat_send: {
-    zh: '回复最近一条微信消息；只能发给刚发消息的人。',
-    en: 'Reply to the latest WeChat message; sends only to the person who just wrote.',
+    zh: '回复绑定的微信用户。',
+    en: 'Reply to the bound WeChat user.',
   },
   wechat_send_image: {
     zh: '把本地一张图片发到微信。',
@@ -18,8 +18,16 @@ const TOOL_SUMMARIES: Record<string, DescribeText> = {
     en: 'Send a local file to WeChat.',
   },
   wechat_status: {
-    zh: '查看微信连接、账号、最近消息与错误。',
-    en: 'Show the WeChat connection, account, last message and errors.',
+    zh: '查看连接、附件状态与模型输入能力。',
+    en: 'Check connection, attachments and model input support.',
+  },
+  wechat_send_voice: {
+    zh: '发送本地音频或宿主音频附件，默认发 MP3 文件卡片。',
+    en: 'Send local audio or a host audio blob, as an MP3 attachment by default.',
+  },
+  wechat_speak: {
+    zh: '启用 TTS 时，将文字合成后发到微信，音频失败时补发原文。',
+    en: 'When TTS is enabled, synthesize and send audio to WeChat, with the original text as a fallback.',
   },
   wechat_events: {
     zh: '按类型和时间查已归档的微信事件。',
@@ -38,6 +46,9 @@ export const WECHAT_CLAW: WorldDefinition<WechatClawConfigSection> = {
     botDir: ctx.botDir,
     dataDir: ctx.dataDir,
     timezone: ctx.timezone,
+    ttsApiKey: (name) => ctx.secret(name),
+    storeTtsApiKey: (name, value) => ctx.storeSecret(name, value),
+    persistTtsSettings: (settings) => ctx.persist(settings),
   }),
   describe: {
     tools: describeTools(WECHAT_CLAW_TOOL_DECLS, TOOL_SUMMARIES),

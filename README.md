@@ -37,6 +37,8 @@
 | `wechat_send` | 回复最近一条微信消息；只能发给刚发消息的人，单条上限 4000 字 |
 | `wechat_send_image` | 把工作区里的一张图发到微信，可带一句说明；工作区外的路径直接拒绝 |
 | `wechat_send_file` | 把工作区里的一个文件发到微信，可带一句说明；同样只限工作区 |
+| `wechat_send_voice` | 把工作区或微信收件目录中的 WAV、MP3、SILK v3 发成 MP3 音频文件卡片，失败时补发文字 |
+| `wechat_speak` | 启用微信 TTS 后，将指定文字合成音频发到微信，失败时补发原文 |
 | `wechat_status` | 连接、账号、最近消息、错误、持有多少条会话令牌，以及工作区/收件目录/允许发送的目录 |
 | `wechat_events` | 按类型和时间查已归档的微信事件 |
 
@@ -60,7 +62,7 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 
 ## 绑定
 
-1. 打开「微信绑定」面板，点「生成二维码」。
+1. 打开「连接与工具」，在微信绑定区域点「生成二维码」。
 2. 用手机微信扫码；二维码打不开时复制面板里的链接。
 3. 手机要求输入数字时，在面板的验证码框里填写并提交。
 
@@ -68,7 +70,7 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 
 ## 配置
 
-配置段是 `worlds.wechat-claw`。
+配置段是 `worlds.wechat-claw`。配置页按「消息投递与回复」「附件收发」「图片与视频」「微信网络」分组。语音合成服务在「连接与工具」的「TTS 设置」中配置。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -94,6 +96,13 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 | `segmentPace` | `1` | 聊天节奏，0～10；越大停顿越久，0 不等待 |
 | `segmentMaxParts` | `8` | 语义段数达到此阈值就恢复完整原文，仅按 4000 字上限分条。0 使用默认值，旧配置大于 8 时按 8 执行 |
 | `segmentMaxTotalSec` | `30` | 累计等待上限，到点不再等但剩下的照常发完 |
+| `nativeVoiceEnabled` | `false` | 「试用微信原生语音条」开关，保存即时生效 |
+| `ttsEnabled` | `false` | 启用 `wechat_speak` |
+| `ttsProtocol` | `openai` | `openai` 为 OpenAI 兼容接口，`gpt-sovits` 为大肥鱼 GPT-SoVITS 公开语音接口 |
+| `ttsBaseUrl` | 空 | TTS 服务地址 |
+| `ttsModel` | 空 | TTS 模型名 |
+| `ttsVoice` | 空 | TTS 声音名 |
+| `ttsSpeed` | `1` | TTS 语速，范围 0.25–4 |
 
 `bot_token`、同步游标和 `context_token` 都在 `<dataDir>/wechat-claw/`，不进配置、不进日志、不进事件 `meta.raw`。
 **它们在工作区外面，所以发不出去**——`wechat_send_image` / `wechat_send_file` 只接受工作区内的路径（见下）。
@@ -137,6 +146,8 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 
 ## 分段发送
 
+`wechat_send` 在分段前转换美元符号包裹的 LaTeX 公式，并把列表项的缩进续文合并到对应标题行。公式尽量转成 Unicode，复杂命令保留可读文本。代码围栏、行内代码与普通金额保留。列表项之间的换行继续参与语义分段。
+
 微信里一次吐一大段不像人说话。打开分段发送后，一次回复会拆成几条，一条一条发，条与条之间停顿。
 
 **拆分只算一次**，不会拆两次：
@@ -157,7 +168,7 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 
 **ASCII `.` 有额外保护**：单个点只在后面跟空白或位于结尾时才当句号。所以 `3.14`、`docs.nonebot.dev`、`report.2026.11.md` 不会被切坏。连续两个及以上的点按省略号保留，换行前也不会删掉；`../`、`..\` 这类路径片段不参与省略号分段。
 
-语义段数**达到** `segmentMaxParts` 时取消语义分段，保留原文的换行和标点。按语义拆出的多条消息会用尽或超出剩余额度时，也会恢复完整原文。超过微信单条 4000 字时仍按长度分条。累计等待超过 `segmentMaxTotalSec` 后，其余消息连续发送。
+语义段数**达到** `segmentMaxParts` 时取消语义分段，保留预处理后文本的换行和标点。按语义拆出的多条消息会用尽或超出剩余额度时，同样发送预处理后的完整文本。超过微信单条 4000 字时仍按长度分条。累计等待超过 `segmentMaxTotalSec` 后，其余消息连续发送。
 
 扩展按复现中的 10 条为每个 `context_token` 设置本地发送上限。文字、媒体和附件说明每成功发出一条都计入同一额度，重启后保留计数。发送前会核对剩余条数，完整内容发不下时会提前拒绝这次调用。收到 `ret=-2 prepare failed` 时会停用这次使用的凭据，报告已发送条数，等对方发来带新凭据的消息再恢复回复。
 
@@ -173,6 +184,22 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 达到分段阈值或关闭分段时不等待。旧的 `segmentDelayMode`、`segmentDelayFixedSec`、`segmentDelayMinSec`、`segmentDelayMaxSec` 不再使用，已有配置可删除；没有 `segmentPace` 时使用默认值 1。
 
 不想要就在配置页关掉「分段发送」。
+
+## 出站音频与 TTS
+
+`wechat_send_voice` 接收工作区或微信收件目录内的绝对路径。默认上传 MP3 音频文件卡片（`media_type: 3`、`item.type: 4`）。已有 MP3 原样上传，WAV（单声道或立体声 PCM/浮点）与 SILK v3 在本地转成 MP3，无需 ffmpeg。消息里的 CDN 引用取自实际上传响应头 `x-encrypted-param`。
+
+也可用 `blob` 参数发送 Core 已保存的音频，接受 `log:`、`mem:` 句柄或 `[blob …]` 回执行。例如先调用 `sovits_speak(silent: true)`，再把回执里的音频句柄传给 `wechat_send_voice`。每次调用在 `path` 和 `blob` 中选一项，仍需可用的微信回复额度。
+
+打开「试用微信原生语音条」后优先将音频编码为 24 kHz、16-bit、单声道腾讯 SILK，用 `media_type: 4` 上传并发送 `type: 3` 的 `voice_item`。接口接收后的显示、播放以手机端为准。原生转码或上传失败、发送被明确拒绝时，自动改发 MP3。
+
+音频处理、上传或明确发送失败时，`wechat_send_voice` 补发 `fallback_text` 提供的转写或说明，留空时发送失败提示。`wechat_speak` 在合成或音频发送失败时补发原文。补发文字使用同一回复凭据和剩余额度。凭据失效、耗尽、工具取消或发送结果不确定时，工具返回失败原因。
+
+打开「连接与工具」里的「TTS 设置」，在同一个抽屉里填写开关、服务地址、模型、声音、语速和 API Key。普通设置与 API Key 分别保存，保存后即时生效。也可为部署设置 `WECHAT_CLAW_TTS_API_KEY`。`wechat_speak(text)` 将文字提交至该服务生成临时 MP3，走同一条音频发送路径，随后清理临时文件。
+
+使用硅基流动时，保存 API Key 后可点「获取模型」，列表只显示账号可见且官方文档确认支持合成的型号。选好模型再点「获取音色」，即可选择官方预置或账号中属于该模型的自定义音色。其他服务仍可手动填写。服务地址也接受末尾为 `/chat/completions` 的兼容接口地址。
+
+使用大肥鱼 GPT-SoVITS 时，先在服务端打开「开放本机语音接口」，再在这里点击「发现本机与局域网服务」。单项结果会直接填入配置，多项结果可从下拉框选择。按「保存设置」生效。大肥鱼默认只监听本机，其他设备需要通过局域网地址提供该公开接口。发现仅在点击按钮后检查本机及当前私有 IPv4 网段的 `9880`、`9883` 端口，也会检查已填写的本机或私网地址。自定义地址或需要令牌的服务可以手动添加，密钥按服务地址单独保存。模型与音色留空时使用服务默认值。合成通过 HTTP `/audio/speech` 返回 WAV，再转成微信音频文件，全程无需调用其他 World 工具。
 
 ## 视频抽帧
 
@@ -190,7 +217,7 @@ OpenCode Provider 必须包含 Gemini 工具回执附件保留修复：Core 将�
 
 ### 装 ffmpeg
 
-在「ffmpeg」面板上点「下载 ffmpeg」才会联网。启用 World、改配置、切 `ffmpegSource` 都不触发下载。
+在「连接与工具」的 FFmpeg 区域点「下载」才会联网。
 
 - 从 `ffmpeg-static` 的 GitHub Releases 下静态构建：压缩包约 27 MB，解压后约 77 MB。
 - 装在 `<dataDir>/wechat-claw/bin/`，**不改系统 PATH**——悄悄改全局环境变量会影响其他程序，卸载扩展后还会留下垃圾。
@@ -271,7 +298,7 @@ Coopanion 启动 Core 时会把系统代理写进 `HTTP_PROXY`/`HTTPS_PROXY`，�
 - `direct`：扩展自己建直连，绕过代理；适合代理只给模型用的情况。
 - `proxy`：用 `proxyUrl` 指定的代理；适合必须走代理才能访问腾讯域名的情况。
 
-网络设置改完要重启 Coopanion。「微信绑定」面板与 `wechat_status` 会显示当前生效的出口。
+网络设置在「配置」的「微信网络」中，修改后需重启 World。`wechat_status` 会显示当前生效的出口。
 
 ## 媒体怎么走
 
@@ -308,6 +335,8 @@ AES-128-ECB 加密 → POST 密文到微信 CDN → 从响应头 `x-encrypted-pa
 - `queueMs`：同一批消息在本地开始处理前的排队时间。
 - `processingMs`：保存状态、下载和准备附件所用的时间，不含 Core 合批与模型响应。
 
+排查微信听写消息时，先查看「收到 N 条微信消息」。异常结构会额外输出「未识别的微信入站结构」，包含跳过原因、类型、已知字段的数据形状和未知字段数量。日志省略消息正文、账号、下载引用和令牌。枚举缺失或未知时，会尝试从已有 `text_item.text` 或 `voice_item.text` 读取文字。
+
 正文里的图片尺寸读自落盘文件本身（JPEG 的 SOF 段、PNG 的 IHDR 等）。微信消息里的
 `thumb_width` / `thumb_height` 是缩略图尺寸，普遍只有 210 像素宽，和真图差一个数量级，
 所以不用它。
@@ -329,7 +358,7 @@ corepack pnpm install
 corepack pnpm typecheck
 corepack pnpm exec tsc -p tsconfig.web.json --noEmit
 corepack pnpm test
-corepack pnpm build          # 打 dist/webui.js
+corepack pnpm build          # 构建 WebUI 的 JS 和 CSS
 ```
 
 测试用本机真端口的假 iLink 服务端，覆盖请求形状、uint64 ID 无损解析、AES 往返、
@@ -373,7 +402,7 @@ cortico-world-wechat-claw/
 │   └── webui/
 │       ├── client.ts     # 面板入口（绑定 + ffmpeg）
 │       └── ffmpeg.ts     # ffmpeg 下载面板
-├── dist/webui.js          # 面板产物
+├── dist/                  # 面板脚本和样式
 ├── scripts/build-webui.mjs
 └── tests/
     ├── paths.test.ts      # 工作区探测、文件名清理、发送边界

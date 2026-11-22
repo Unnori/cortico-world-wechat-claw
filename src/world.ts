@@ -3,7 +3,7 @@
  *
  * 一个 iLink 一对一通道：扫码绑定、长轮询收消息、按类型回复文字/图片/文件。
  * 入站消息走 `wechat-claw.message` 事件，媒体作为附件随事件交给模型；
- * 出站工具把本地路径上传到微信 CDN 再发出去。
+ * 出站工具把本地文件或宿主音频附件上传到微信 CDN 再发出去。
  *
  * 这个通道的限制是平台给的：只能一对一，只能回复最近发消息的人，`context_token` 约 24 小时后失效。
  * 没有群聊、好友列表、朋友圈，也不能主动发起会话。
@@ -18,8 +18,8 @@
  * 下的 `auth.json`、`context-tokens.json`）在工作区外面，所以即使模型被说服「把它自己的令牌发出去」，
  * 也拿不到那些字节。
  */
-import { readFile, stat } from 'node:fs/promises';
-import { basename, isAbsolute, join } from 'node:path';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { basename, extname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import QRCode from 'qrcode';
@@ -41,18 +41,25 @@ import { nowIso } from 'cortico/core/util.ts';
 import { ILinkApi, ILinkError, MAX_TEXT_CHARS, DEFAULT_BASE_URL, DEFAULT_CDN_BASE_URL, errorText } from './protocol/api.ts';
 import { MediaTransfer } from './protocol/media.ts';
 import { closeNetworkRoute, createNetworkRoute, type NetworkRoute } from './protocol/network.ts';
-import { fileMessage, imageMessage, textMessage, videoMessage } from './protocol/outbound.ts';
-import { mimeFromFilename } from './protocol/mime.ts';
+import { fileMessage, imageMessage, textMessage, videoMessage, voiceMessage } from './protocol/outbound.ts';
+import { mimeForInbound, mimeFromFilename } from './protocol/mime.ts';
 import { clockText, messageTimeMs, renderInbound, shortId } from './protocol/inbound.ts';
-import { UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/types.ts';
+import { inboundMessageShape, inboundWireType } from './protocol/inbound-shape.ts';
+import { MessageType, UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/types.ts';
 import { ILinkDriver } from './driver.ts';
 import { CredentialStore, MAX_REPLIES_PER_CONTEXT, type AuthRecord, type ReplyContext } from './store.ts';
 import { pickChannel, splitText } from './text.ts';
 import { fitImage, overCountNote, probeImage, type ImageLimits } from './media/imagefit.ts';
 import { MAX_FRAMES } from './media/layout.ts';
 import { segmentDelayMs, splitSegments } from './segment.ts';
+import { prepareOutboundText } from './outbound-text.ts';
 import { ensureFfmpeg, installFfmpeg, installedSize, removeFfmpeg, type FfmpegResolution, type InstallProgress } from './media/ffmpeg.ts';
 import { extractFrameStrip } from './media/frames.ts';
+import { audioToMp3, audioToSilk } from './media/outbound-voice.ts';
+import { SILK_SAMPLE_RATE } from './media/voice.ts';
+import { synthesizeMp3, TTS_MAX_CHARS, ttsSecretName, validateTtsSettings } from './media/tts.ts';
+import { listTtsModels, listTtsVoices } from './media/tts-catalog.ts';
+import { discoverLocalTts, listLocalTtsModels, localTtsVoices, type LocalTtsService } from './media/tts-local.ts';
 import {
   checkSendable,
   derivedDir,
@@ -64,8 +71,11 @@ import {
 import {
   MAX_SEGMENT_THRESHOLD,
   resolveInboundTrigger,
-  WECHAT_CLAW_CONFIG_GROUP,
+  wechatClawConfigGroups,
   wechatClawText,
+  type TtsPanelState,
+  type TtsProtocol,
+  type TtsSettings,
   type WechatClawConfigSection,
 } from './config.ts';
 
@@ -85,8 +95,23 @@ interface ReplyTarget {
   context: ReplyContext;
 }
 
+class ReplySendError extends Error {}
+
 const CONTEXT_EXHAUSTED = '当前入站消息的回复条数配额已用尽，请等对方发来下一条消息后再回复。';
 const CONTEXT_REJECTED = '服务端拒绝了本次回复，此回复凭据已停用（可能已用尽回复配额或失效），请等对方发来下一条消息后再回复。';
+
+function isPrepareFailure(error: unknown): boolean {
+  return error instanceof ILinkError && error.ret === -2 && /\bprepare\s+failed\b/i.test(error.message);
+}
+
+function canFallbackAfterSend(error: ReplySendError): boolean {
+  // sendmessage may already have accepted a request whose response was lost.
+  // Retrying in that case could deliver twice and consume another reply slot.
+  const rejection = error.cause;
+  return rejection instanceof ILinkError && !isPrepareFailure(rejection) &&
+    (rejection.ret !== undefined && rejection.ret !== 0 && rejection.ret !== -14 ||
+      rejection.status !== undefined && [400, 403, 415, 422].includes(rejection.status));
+}
 
 type AttachmentBlob = Extract<BlobInput, { bytes: Uint8Array }>;
 
@@ -132,6 +157,17 @@ export interface WechatClawWorldOptions {
    * 生产不传；测试把它指向本机假服务端，这样测的是真实请求构造。
    */
   endpoints?: { apiBaseUrl?: string; cdnBaseUrl?: string };
+  ttsApiKey?: (name: string) => string;
+  storeTtsApiKey?: (name: string, value: string) => void;
+  persistTtsSettings?: (settings: TtsSettings) => void;
+}
+
+function ttsPanelService(protocol: unknown, address: unknown, defaults?: TtsSettings): { protocol: TtsProtocol; baseUrl: string } {
+  const selected = protocol ?? defaults?.ttsProtocol ?? 'openai';
+  if (selected !== 'openai' && selected !== 'gpt-sovits') throw new Error('TTS 服务类型无效。');
+  const baseUrl = address ?? defaults?.ttsBaseUrl ?? '';
+  if (typeof baseUrl !== 'string') throw new Error('TTS 服务地址无效。');
+  return { protocol: selected, baseUrl: baseUrl.trim() };
 }
 
 /** 全部工具声明；`tools()` 与 `describe` 用同一份。 */
@@ -139,16 +175,12 @@ export const WECHAT_CLAW_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'wechat_send',
     tags: ['speak'],
-    description:
-      'Send a WeChat reply to the person whose inbound message arrived most recently. '
-      + 'The channel is one-to-one and reply-only: a context token from that message must still be valid. '
-      + 'Put the reply in one call when possible. Text, captions and media share the same reply allowance. '
-      + `Text longer than ${MAX_TEXT_CHARS} characters is split into consecutive messages, so write the whole reply at once.`,
+    description: `Reply to the bound WeChat user. Send the full reply in one call; text over ${MAX_TEXT_CHARS} characters is split automatically.`,
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        text: { type: 'string', minLength: 1, description: 'Reply text.' },
+        text: { type: 'string', minLength: 1 },
       },
       required: ['text'],
     },
@@ -156,19 +188,13 @@ export const WECHAT_CLAW_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'wechat_send_image',
     tags: ['speak'],
-    description:
-      'Send a picture to the person whose inbound message arrived most recently. '
-      + 'Takes an absolute local file path inside the pet workspace (or the configured inbox); '
-      + 'paths outside it are refused, so move a file into the workspace first. '
-      + 'The file is uploaded to the WeChat CDN and delivered as a picture. '
-      + 'A path whose content is not an image is delivered as a file instead, and the receipt says so. '
-      + 'Optional caption is sent as a separate text message first.',
+    description: 'Reply with a local image.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Absolute path of a local picture file inside the workspace.' },
-        caption: { type: 'string', description: 'Optional text sent before the picture.' },
+        path: { type: 'string', description: 'Absolute image path in an allowed directory.' },
+        caption: { type: 'string', description: 'Separate text sent before the image.' },
       },
       required: ['path'],
     },
@@ -176,52 +202,66 @@ export const WECHAT_CLAW_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'wechat_send_file',
     tags: ['speak'],
-    description:
-      'Send a file attachment to the person whose inbound message arrived most recently. '
-      + 'Takes an absolute local file path inside the pet workspace (or the configured inbox); '
-      + 'paths outside it are refused, so move a file into the workspace first. '
-      + 'The file is uploaded to the WeChat CDN and delivered as a downloadable file. '
-      + 'Video files are delivered as videos, not as attachments. '
-      + 'Optional caption is sent as a separate text message first.',
+    description: 'Reply with a local file. Videos and images use their native media types.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Absolute path of a local file inside the workspace.' },
-        caption: { type: 'string', description: 'Optional text sent before the file.' },
+        path: { type: 'string', description: 'Absolute file path in an allowed directory.' },
+        caption: { type: 'string', description: 'Separate text sent before the file.' },
       },
       required: ['path'],
     },
   },
   {
+    name: 'wechat_send_voice',
+    tags: ['speak'],
+    description: 'Reply with audio from a local path or a host blob. Sends MP3 by default.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: { type: 'string', minLength: 1, description: 'Absolute WAV, MP3 or SILK v3 path in the workspace or inbox.' },
+        blob: { type: 'string', minLength: 1, description: 'Audio log:/mem: handle or its [blob ...] receipt line.' },
+        fallback_text: { type: 'string', maxLength: TTS_MAX_CHARS, description: 'Text to send on audio failure. Defaults to a failure notice.' },
+      },
+      oneOf: [{ required: ['path'] }, { required: ['blob'] }],
+    },
+  },
+  {
+    name: 'wechat_speak',
+    tags: ['speak'],
+    description: 'With TTS enabled, reply with synthesized speech. Falls back to the original text on audio failure.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { text: { type: 'string', minLength: 1, maxLength: TTS_MAX_CHARS } },
+      required: ['text'],
+    },
+  },
+  {
     name: 'wechat_status',
     tags: ['read', 'snapshot'],
-    description:
-      'Report the WeChat ClawBot connection: bound account, whether the long poll is connected, '
-      + 'the last inbound message time, the last error and how many context tokens are held. '
-      + 'Also reports live model input support, receive switches and the last attachment delivery results. '
-      + 'Pass mimes to check specific file types against the active Provider.',
+    description: 'Check WeChat connection, allowed send paths, active Provider input support and recent attachment results.',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
-        mimes: { type: 'array', maxItems: 128, items: { type: 'string', minLength: 1 }, description: 'Optional exact MIME types, such as audio/wav, video/mp4 or application/pdf.' },
+        mimes: { type: 'array', maxItems: 128, items: { type: 'string', minLength: 1 }, description: 'Exact MIME types to check, e.g. audio/wav or application/pdf.' },
       },
     },
   },
   {
     name: 'wechat_events',
     tags: ['read'],
-    description:
-      'Read archived WeChat events by kind and time. kind accepts * as a wildcard. '
-      + 'Raw payloads never include context tokens.',
+    description: 'Read archived WeChat messages.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        kind: { type: 'string', description: 'Event kind or glob, for example message/private.' },
-        since: { type: 'string', description: 'ISO 8601 lower bound, inclusive.' },
-        until: { type: 'string', description: 'ISO 8601 upper bound, inclusive.' },
-        limit: { type: 'integer', description: 'Maximum events to return, 1-100, default 30.' },
+        kind: { type: 'string', description: 'Event kind or * glob, e.g. message/private.' },
+        since: { type: 'string', description: 'Inclusive ISO 8601 start.' },
+        until: { type: 'string', description: 'Inclusive ISO 8601 end.' },
+        limit: { type: 'integer', description: 'Up to 100 messages, default 30.' },
       },
     },
   },
@@ -241,6 +281,19 @@ const parseIso = (value: unknown): string | null => {
   return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 };
 
+function voiceBlobHandle(value: unknown): string {
+  const text = typeof value === 'string' ? value.trim() : '';
+  const line = /^\[blob[ \t]+([^\]\r\n]+)\]/.exec(text);
+  // Core appends MIME and an optional filename inside the brackets.
+  const handle = line
+    ? line[1]!.split(/[ \t]+(?=(?:audio|application|image|video|text)\/[\w.+-]+(?:[ \t]|$))/, 1)[0]!.trim()
+    : text;
+  if (!/^(?:log|mem):[^\u0000-\u001f\u007f]+$/.test(handle)) {
+    throw new Error('blob 须为 log:、mem: 音频句柄，或工具回执里的 [blob …] 行。');
+  }
+  return handle;
+}
+
 export class WechatClawWorld implements World {
   readonly id = ID;
 
@@ -255,7 +308,11 @@ export class WechatClawWorld implements World {
   readonly #store: CredentialStore;
   readonly #apiBaseUrl: string = DEFAULT_BASE_URL;
   readonly #cdnBaseUrl: string = DEFAULT_CDN_BASE_URL;
+  readonly #readTtsApiKey: (name: string) => string;
+  readonly #storeTtsApiKey?: (name: string, value: string) => void;
+  readonly #persistTtsSettings?: (settings: TtsSettings) => void;
 
+  #ttsDiscovery?: Promise<LocalTtsService[]>;
   #host: WorldHost | null = null;
   #route: NetworkRoute | null = null;
   #api: ILinkApi | null = null;
@@ -298,6 +355,9 @@ export class WechatClawWorld implements World {
     this.#store = new CredentialStore(`${opts.dataDir}/${ID}`);
     this.#apiBaseUrl = opts.endpoints?.apiBaseUrl ?? DEFAULT_BASE_URL;
     this.#cdnBaseUrl = opts.endpoints?.cdnBaseUrl ?? DEFAULT_CDN_BASE_URL;
+    this.#readTtsApiKey = opts.ttsApiKey ?? (() => '');
+    this.#storeTtsApiKey = opts.storeTtsApiKey;
+    this.#persistTtsSettings = opts.persistTtsSettings;
   }
 
   /** 只报值；文案在 ENV_PROMPT.md 里。每轮前缀重建都会调用，所以只读内存。 */
@@ -338,6 +398,8 @@ export class WechatClawWorld implements World {
         case 'wechat_send': return await this.#queueSend(ctx, () => this.#toolSendText(args));
         case 'wechat_send_image': return await this.#queueSend(ctx, () => this.#toolSendMedia(args, 'image'));
         case 'wechat_send_file': return await this.#queueSend(ctx, () => this.#toolSendMedia(args, 'file'));
+        case 'wechat_send_voice': return await this.#queueSend(ctx, () => this.#toolSendVoice(args, ctx.signal));
+        case 'wechat_speak': return await this.#queueSend(ctx, () => this.#toolSpeak(args, ctx.signal));
         case 'wechat_status': return this.#toolStatus(args);
         case 'wechat_events': return this.#toolEvents(args);
         default: return `[wechat] 未知工具：${name}`;
@@ -413,11 +475,11 @@ export class WechatClawWorld implements World {
       return response;
     } catch (err) {
       let reason = errorText(err);
-      if (err instanceof ILinkError && err.ret === -2 && /\bprepare\s+failed\b/i.test(err.message)) {
+      if (isPrepareFailure(err)) {
         await this.#recordReply(target, 'rejected');
         reason += `。${CONTEXT_REJECTED}`;
       }
-      throw new Error(`微信回复已发 ${sent}/${total} 条。${reason}`, { cause: err });
+      throw new ReplySendError(`微信回复已发 ${sent}/${total} 条。${reason}`, { cause: err });
     }
   }
 
@@ -429,14 +491,14 @@ export class WechatClawWorld implements World {
    * 全部发完才返回——回执报「已发送」时不骗人。
    */
   async #toolSendText(args: Record<string, unknown>): Promise<string> {
-    const text = String(args.text ?? '').trim();
+    const { text, boundaries } = prepareOutboundText(String(args.text ?? '').trim());
     if (!text) throw new Error('text 不能为空。');
     const target = await this.#replyTarget();
     const { to } = target;
     const contextToken = target.context.token;
     const remaining = MAX_REPLIES_PER_CONTEXT - target.context.sent;
 
-    const { chunks, segmentationCancelled, waits } = this.#planChunks(text, remaining);
+    const { chunks, segmentationCancelled, waits } = this.#planChunks(text, boundaries, remaining);
     this.#ensureReplyCapacity(chunks.length, remaining);
 
     let sleptMs = 0;
@@ -466,7 +528,7 @@ export class WechatClawWorld implements World {
 
     const bits: string[] = [];
     if (chunks.length > 1) bits.push(`分 ${chunks.length} 条`);
-    if (segmentationCancelled) bits.push('受分段阈值或剩余回复额度限制，已取消语义分段并发送完整原文');
+    if (segmentationCancelled) bits.push('受分段阈值或剩余回复额度限制，已取消语义分段并发送完整内容');
     if (budgetCut) bits.push('等待到上限，其余连着发完');
     if (sleptMs > 0) bits.push(`共等待 ${(sleptMs / 1000).toFixed(1)} 秒`);
     const suffix = bits.length ? `，${bits.join('，')}` : '';
@@ -483,10 +545,10 @@ export class WechatClawWorld implements World {
    *
    * 分段关闭时退化成原来的行为：只按长度切、不等。
    */
-  #planChunks(text: string, remaining: number): { chunks: string[]; waits: number[]; segmentationCancelled: boolean } {
+  #planChunks(text: string, boundaries: string, remaining: number): { chunks: string[]; waits: number[]; segmentationCancelled: boolean } {
     const enabled = this.#cfg.segmentEnabled !== false;
     if (enabled) {
-      const parts = splitSegments(text);
+      const parts = splitSegments(text, boundaries);
       const configured = Math.floor(Number(this.#cfg.segmentMaxParts));
       const threshold = configured > 0 ? Math.min(configured, MAX_SEGMENT_THRESHOLD) : MAX_SEGMENT_THRESHOLD;
       if (parts.length < threshold) {
@@ -554,7 +616,7 @@ export class WechatClawWorld implements World {
 
     const info = await stat(filePath).catch(() => null);
     if (!info?.isFile()) throw new Error(`找不到文件：${rawPath}`);
-    const maxBytes = Math.max(1, Number(this.#cfg.maxInboundMediaMb) || 20) * 1024 * 1024;
+    const maxBytes = this.#mediaByteLimit();
     if (info.size > maxBytes) {
       throw new Error(`文件超过上限（${Math.round(info.size / 1024 / 1024)} MB > ${Math.round(maxBytes / 1024 / 1024)} MB）。`);
     }
@@ -736,30 +798,203 @@ export class WechatClawWorld implements World {
     return this.#media;
   }
 
+  #mediaByteLimit(): number {
+    return Math.max(1, Number(this.#cfg.maxInboundMediaMb) || 20) * 1024 * 1024;
+  }
+
+  async #toolSendVoice(args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+    if ((args.path === undefined) === (args.blob === undefined)) throw new Error('请只提供 path 或 blob 其中一项。');
+    const fallback = String(args.fallback_text ?? '').trim() || '这段音频未能发出。';
+    if (fallback.length > TTS_MAX_CHARS) throw new Error(`fallback_text 不能超过 ${TTS_MAX_CHARS} 字。`);
+    if (args.blob !== undefined) {
+      const handle = voiceBlobHandle(args.blob);
+      const target = await this.#replyTarget();
+      signal?.throwIfAborted();
+      const blob = this.#host?.blob(handle);
+      if (!blob) throw new Error('找不到该音频附件。请使用仍可用的 log: 或 mem: 句柄。');
+      if (blob.bytes.byteLength > this.#mediaByteLimit()) throw new Error('音频附件超过单条媒体大小上限。');
+      // Core may store audio formats without a known log extension as .bin.
+      const mime = blob.mime === 'application/octet-stream' ? mimeForInbound(blob.bytes) : blob.mime;
+      if (!mime.startsWith('audio/')) throw new Error('该附件不是音频。');
+      const input = Buffer.from(blob.bytes.buffer, blob.bytes.byteOffset, blob.bytes.byteLength);
+      return this.#withAudioFallback(target, fallback, signal, () => this.#sendVoice(input, '语音回复.mp3', target, signal));
+    }
+
+    const rawPath = String(args.path ?? '').trim();
+    if (!isAbsolute(rawPath)) throw new Error('path 必须是工作区或微信收件目录内的绝对路径。');
+    const checked = checkSendable(rawPath, [this.#workspaceDir, this.#inboxDir]);
+    if (!checked.ok) {
+      throw new Error(checked.reason === 'missing' ? '找不到音频文件。' : '音频文件不在工作区或微信收件目录内。');
+    }
+    const target = await this.#replyTarget();
+    return this.#withAudioFallback(target, fallback, signal, () => this.#sendVoiceFile(checked.path, target, signal));
+  }
+
+  async #sendVoiceFile(path: string, target: ReplyTarget, signal?: AbortSignal): Promise<string> {
+    const info = await stat(path);
+    if (!info.isFile()) throw new Error('音频路径须指向文件。');
+    if (info.size > this.#mediaByteLimit()) throw new Error('音频文件超过单条媒体大小上限。');
+    const input = await readFile(path, { signal });
+    return this.#sendVoice(input, basename(path, extname(path)) + '.mp3', target, signal);
+  }
+
+  async #sendVoice(input: Buffer, fileName: string, target: ReplyTarget, signal?: AbortSignal): Promise<string> {
+    signal?.throwIfAborted();
+    this.#assertReplyActive(target);
+    const maxBytes = this.#mediaByteLimit();
+    const { to, context: { token: contextToken } } = target;
+    let filePrefix = '已发送';
+    if (this.#cfg.nativeVoiceEnabled === true) {
+      try {
+        const { bytes, durationMs } = await audioToSilk(input, maxBytes, signal);
+        signal?.throwIfAborted();
+        this.#assertReplyActive(target);
+        const uploaded = await this.#requireMedia().upload({ bytes, toUserId: to, mediaType: UploadMediaType.VOICE });
+        signal?.throwIfAborted();
+        await this.#sendReply(target, voiceMessage({
+          to, contextToken, uploaded, sampleRate: SILK_SAMPLE_RATE, durationMs,
+        }), 0, 1);
+        return `微信接口已接收发给 ${shortId(to)} 的原生语音（${durationMs / 1000} 秒）。`;
+      } catch (error) {
+        if (error instanceof ReplySendError && !canFallbackAfterSend(error)) throw error;
+        signal?.throwIfAborted();
+        this.#assertReplyActive(target);
+        this.#host?.log?.warn?.('微信语音改用 MP3 文件发送');
+        filePrefix = '原生语音失败，已改发';
+      }
+    }
+
+    const bytes = await audioToMp3(input, maxBytes, signal);
+    signal?.throwIfAborted();
+    this.#assertReplyActive(target);
+    const uploaded = await this.#requireMedia().upload({ bytes, toUserId: to, mediaType: UploadMediaType.FILE });
+    signal?.throwIfAborted();
+    await this.#sendReply(target, fileMessage({ to, fileName, uploaded, contextToken }), 0, 1);
+    return `${filePrefix} MP3 音频文件「${fileName}」到微信（${shortId(to)}）。`;
+  }
+
+  async #withAudioFallback(
+    target: ReplyTarget,
+    fallbackText: string,
+    signal: AbortSignal | undefined,
+    sendAudio: () => Promise<string>,
+  ): Promise<string> {
+    try {
+      return await sendAudio();
+    } catch (error) {
+      if (error instanceof ReplySendError && !canFallbackAfterSend(error)) throw error;
+      signal?.throwIfAborted();
+      this.#assertReplyActive(target);
+      const remaining = MAX_REPLIES_PER_CONTEXT - target.context.sent;
+      const { text } = prepareOutboundText(fallbackText);
+      const chunks = this.#splitToFit(text, remaining);
+      const truncated = chunks.length > remaining;
+      if (truncated) {
+        chunks.length = remaining;
+        chunks[remaining - 1] = splitText(chunks[remaining - 1]!, MAX_TEXT_CHARS - 1, true, false)[0]! + '…';
+      }
+      for (const [index, chunk] of chunks.entries()) {
+        signal?.throwIfAborted();
+        await this.#sendReply(target, textMessage({ to: target.to, contextToken: target.context.token, text: chunk }), index, chunks.length);
+      }
+      this.#host?.log?.warn?.('微信音频失败后已补发文字', { parts: chunks.length, truncated });
+      const detail = truncated ? '（剩余额度有限，已截短）' : '';
+      return `音频未能发送，已向微信（${shortId(target.to)}）补发文字${detail}。`;
+    }
+  }
+
+  async #toolSpeak(args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+    if (this.#cfg.ttsEnabled !== true) throw new Error('微信 TTS 未启用，请先在「连接与工具」的 TTS 设置中打开。');
+    const text = String(args.text ?? '').trim();
+    if (!text || text.length > TTS_MAX_CHARS) throw new Error(`TTS 文本长度须为 1–${TTS_MAX_CHARS} 字。`);
+    const target = await this.#replyTarget();
+    return this.#withAudioFallback(target, text, signal, async () => {
+      const mp3 = await synthesizeMp3(text, this.#cfg, this.#ttsApiKey(), this.#mediaByteLimit(), signal);
+      signal?.throwIfAborted();
+      this.#assertReplyActive(target);
+      const dir = await mkdtemp(join(this.#dataDir, ID, 'tts-'));
+      const path = join(dir, '语音回复.mp3');
+      try {
+        await writeFile(path, mp3, { flag: 'wx', mode: 0o600 });
+        return await this.#sendVoiceFile(path, target, signal);
+      } finally {
+        await rm(dir, { recursive: true, force: true }).catch(() => {
+          this.#host?.log?.warn?.('微信 TTS 临时文件清理失败');
+        });
+      }
+    });
+  }
+
   // ---- 绑定 ----
 
+  #ttsState(): TtsPanelState {
+    return {
+      ttsEnabled: this.#cfg.ttsEnabled === true,
+      ttsProtocol: this.#cfg.ttsProtocol ?? 'openai',
+      ttsBaseUrl: this.#cfg.ttsBaseUrl ?? '',
+      ttsModel: this.#cfg.ttsModel ?? '',
+      ttsVoice: this.#cfg.ttsVoice ?? '',
+      ttsSpeed: this.#cfg.ttsSpeed ?? 1,
+      keyConfigured: Boolean(this.#ttsApiKey()),
+    };
+  }
+
+  #ttsApiKey(protocol = this.#cfg.ttsProtocol ?? 'openai', baseUrl = this.#cfg.ttsBaseUrl ?? ''): string {
+    let name: string;
+    try { name = ttsSecretName(protocol, baseUrl); }
+    catch { return ''; }
+    return this.#readTtsApiKey(name);
+  }
+
+  #discoverTts(draft: unknown): Promise<LocalTtsService[]> {
+    this.#ttsDiscovery ??= discoverLocalTts(draft).finally(() => { this.#ttsDiscovery = undefined; });
+    return this.#ttsDiscovery;
+  }
+
   #invokePanel(panel: string, method: string, args: unknown[]): unknown {
-    if (panel === 'binding') {
-      switch (method) {
-        case 'state': return this.#publicState();
-        case 'start': return this.#startBinding();
-        case 'verify': return this.#submitVerify(args?.[0]);
-        case 'cancel': return this.#cancelBinding();
-        case 'reconnect': return this.#reconnect();
-        case 'unbind': return this.#unbind();
-        default: throw new Error(`未知方法：${panel}.${method}`);
+    if (panel !== 'binding') throw new Error(`未知面板：${panel}`);
+    switch (method) {
+      case 'state': return this.#publicState();
+      case 'start': return this.#startBinding();
+      case 'verify': return this.#submitVerify(args[0]);
+      case 'cancel': return this.#cancelBinding();
+      case 'reconnect': return this.#reconnect();
+      case 'unbind': return this.#unbind();
+      case 'ffmpeg-state': return this.#ffmpegState();
+      case 'ffmpeg-install': return this.#startFfmpegInstall();
+      case 'ffmpeg-cancel': return this.#cancelFfmpegInstall();
+      case 'ffmpeg-remove': return this.#removeFfmpeg();
+      case 'tts-state': return this.#ttsState();
+      case 'tts-discover': return this.#discoverTts(args[0]);
+      case 'tts-key-state': {
+        const { protocol, baseUrl } = ttsPanelService(args[0], args[1]);
+        return { keyConfigured: Boolean(this.#ttsApiKey(protocol, baseUrl)) };
       }
-    }
-    if (panel === 'ffmpeg') {
-      switch (method) {
-        case 'state': return this.#ffmpegState();
-        case 'install': return this.#startFfmpegInstall();
-        case 'cancel': return this.#cancelFfmpegInstall();
-        case 'remove': return this.#removeFfmpeg();
-        default: throw new Error(`未知方法：${panel}.${method}`);
+      case 'tts-list-models': {
+        const { protocol, baseUrl } = ttsPanelService(args[1], args[0]);
+        const key = this.#ttsApiKey(protocol, baseUrl);
+        return protocol === 'gpt-sovits' ? listLocalTtsModels(baseUrl, key) : listTtsModels(baseUrl, key);
       }
+      case 'tts-list-voices': {
+        const { protocol, baseUrl } = ttsPanelService(args[2], args[0]);
+        return protocol === 'gpt-sovits' ? localTtsVoices() : listTtsVoices(baseUrl, args[1], this.#ttsApiKey(protocol, baseUrl));
+      }
+      case 'tts-save-settings': {
+        const settings = validateTtsSettings(args[0]);
+        if (!this.#persistTtsSettings) throw new Error('当前宿主未提供配置存储。');
+        this.#persistTtsSettings(settings);
+        return this.#ttsState();
+      }
+      case 'tts-save-key': {
+        const key = typeof args[0] === 'string' ? args[0].trim() : '';
+        if (!key || /\s/.test(key)) throw new Error('请输入有效的 TTS API Key。');
+        if (!this.#storeTtsApiKey) throw new Error('当前宿主未提供凭据存储。');
+        const { protocol, baseUrl } = ttsPanelService(args[1], args[2], this.#cfg);
+        this.#storeTtsApiKey(ttsSecretName(protocol, baseUrl), key);
+        return { keyConfigured: true };
+      }
+      default: throw new Error(`未知方法：${panel}.${method}`);
     }
-    throw new Error(`未知面板：${panel}`);
   }
 
   /** 「ffmpeg」面板的状态：装没装、能不能用、正在装到哪一步。 */
@@ -1170,16 +1405,10 @@ export class WechatClawWorld implements World {
       panels: [{
         id: 'binding',
         title: t.panelTitle,
-        description: t.panelDesc,
-        getMethods: ['state'],
-      }, {
-        id: 'ffmpeg',
-        title: t.ffmpegPanelTitle,
-        description: t.ffmpegPanelDesc,
-        getMethods: ['state'],
+        getMethods: ['state', 'ffmpeg-state', 'tts-state'],
       }],
       invoke: (panel, method, args) => Promise.resolve(this.#invokePanel(panel, method, args ?? [])),
-      config: [WECHAT_CLAW_CONFIG_GROUP],
+      config: wechatClawConfigGroups(language),
       promptDocs: [{
         key: `worlds.${ID}.envPrompt`,
         title: t.promptTitle,
@@ -1192,7 +1421,7 @@ export class WechatClawWorld implements World {
           { name: 'wechat.lastMessageAt', description: '最近一条入站消息的时间。' },
           { name: 'wechat.lastError', description: '最近一次连接错误。' },
           { name: 'wechat.inbox', description: '收件目录的绝对路径（收到的图片、文件、视频、语音都在这里）。' },
-          { name: 'wechat.workspace', description: '桌宠工作区的绝对路径；能发到微信的文件只在这个范围内。' },
+          { name: 'wechat.workspace', description: '桌宠工作区的绝对路径。' },
         ],
       }],
     };
@@ -1448,18 +1677,32 @@ export class WechatClawWorld implements World {
     return true;
   }
 
+  #logInboundShape(reason: string, shape: Record<string, unknown>): void {
+    this.#host?.log?.warn?.('未识别的微信入站结构', { reason, ...shape });
+  }
+
   async #handleInbound(driver: ILinkDriver, message: WeixinMessage, receivedAtMs: number): Promise<void> {
     if (driver !== this.#driver) return;
     // 自己发出去的消息不回到自己这里。
-    if (Number(message?.message_type) === 2) return;
-    const from = String(message?.from_user_id ?? '').trim();
-    if (!from) return;
+    const from = typeof message?.from_user_id === 'string' ? message.from_user_id.trim() : '';
+    const type = inboundWireType(message?.message_type);
+    if (type === MessageType.BOT) {
+      if (from && from === this.#auth?.userId) this.#logInboundShape('unexpected-bot-message-from-owner', inboundMessageShape(message));
+      return;
+    }
+    if (!from) {
+      this.#logInboundShape('missing-sender', inboundMessageShape(message));
+      return;
+    }
     if (this.#auth?.accountId && from === this.#auth.accountId) return;
 
     // 只接受绑定本人发来的消息。别的人（群成员、服务通知、陌生人）一律丢弃：
     // 收件人已经钉死在 auth.userId，这里再放行，非本人的内容就会进入上下文，
     // 并且「回复」的语义会被引到错误的人身上。
     if (!this.#acceptSender(from)) return;
+    if (type !== MessageType.USER && type !== MessageType.NONE) {
+      this.#logInboundShape('unexpected-message-type', inboundMessageShape(message));
+    }
 
     const processingAtMs = Date.now();
     const atMs = messageTimeMs(message);
@@ -1482,7 +1725,7 @@ export class WechatClawWorld implements World {
       this.#host?.log?.warn?.('最近消息时间未保存', { error: errorText(err) });
     }
 
-    const maxBytes = Math.max(1, Number(this.#cfg.maxInboundMediaMb) || 20) * 1024 * 1024;
+    const maxBytes = this.#mediaByteLimit();
     const rendered = await renderInbound(message, {
       media: this.#media,
       inboxDir: this.#inboxDir,
@@ -1491,6 +1734,7 @@ export class WechatClawWorld implements World {
       downloadVoice: this.#cfg.receiveVoices !== false,
       downloadVideo: this.#cfg.receiveVideos === true,
       maxBytes,
+      onUnexpected: (reason, shape) => this.#logInboundShape(reason, shape),
     });
 
     const blobs: AttachmentBlob[] = [];

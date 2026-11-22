@@ -16,6 +16,9 @@ import { extensionForInbound, imageSize, mimeForInbound, silkV3HeaderLength, sni
 import { silkToWav } from '../media/voice.ts';
 import type { MediaTransfer } from './media.ts';
 import { MessageItemType, type MessageItem, type WeixinMessage } from './types.ts';
+import { inboundItemShape, inboundMessageShape, inboundWireType } from './inbound-shape.ts';
+
+const KNOWN_ITEM_TYPES = new Set<number>(Object.values(MessageItemType).filter(type => type !== MessageItemType.NONE));
 
 export interface InboundMedia {
   /** 落盘的本地绝对路径。 */
@@ -51,8 +54,9 @@ export function shortId(value: unknown): string {
 }
 
 export function messageTimeMs(msg: WeixinMessage): number {
-  const ms = Number(msg?.create_time_ms);
-  if (Number.isFinite(ms) && ms > 0) return ms;
+  const raw = msg?.create_time_ms;
+  const ms = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : 0;
+  if (Number.isFinite(ms) && ms > 0 && ms <= 8.64e15) return ms;
   return Date.now();
 }
 
@@ -83,7 +87,7 @@ export function quoteSummary(item: MessageItem | undefined): string {
   const ref = item?.ref_msg;
   if (!ref) return '';
   const parts: string[] = [];
-  if (ref.title?.trim()) parts.push(ref.title.trim());
+  if (typeof ref.title === 'string' && ref.title.trim()) parts.push(ref.title.trim());
   const inner = ref.message_item;
   if (inner) {
     if (inner.type === MessageItemType.TEXT) parts.push(String(inner.text_item?.text ?? '').trim());
@@ -127,6 +131,7 @@ function voiceMime(encodeType: number | undefined): string {
 
 export interface RenderOptions {
   media: MediaTransfer | null;
+  onUnexpected?: (reason: string, shape: Record<string, unknown>) => void;
   /** 收件目录，绝对路径。媒体按类型落到它下面的 images/files/videos/voices。 */
   inboxDir: string;
   /** 每类媒体是否下载。关掉时只留占位文字。 */
@@ -193,19 +198,39 @@ export async function renderInbound(
   const lines: string[] = [];
   let transcript = '';
 
-  for (const item of items) {
-    const type = Number(item?.type);
+  if (!items.length) {
+    opts.onUnexpected?.('missing-or-empty-item-list', inboundMessageShape(msg));
+  }
+  for (const [index, item] of items.entries()) {
+    const reportedType = inboundWireType(item?.type);
+    const text = typeof item?.text_item?.text === 'string' ? item.text_item.text : '';
+    const voiceText = typeof item?.voice_item?.text === 'string' ? item.voice_item.text.trim() : '';
+    let type = reportedType;
+    const report = (reason: string): void => {
+      opts.onUnexpected?.(reason, { index, ...inboundItemShape(item) });
+    };
+    // A transcription can carry the documented text or voice body without a
+    // matching discriminator. Do not infer media or internal tool calls.
+    if (type === undefined || !KNOWN_ITEM_TYPES.has(type) ||
+      type === MessageItemType.TEXT && !text.trim() ||
+      type === MessageItemType.VOICE && !voiceText && !item?.voice_item?.media) {
+      if (text.trim()) type = MessageItemType.TEXT;
+      else if (voiceText) type = MessageItemType.VOICE;
+      if (type !== reportedType) report('recovered-item-type');
+    }
     if (type === MessageItemType.TEXT) {
-      const text = String(item.text_item?.text ?? '');
       if (text.trim()) lines.push(text);
+      else report('empty-text-item');
       continue;
     }
     if (type === MessageItemType.VOICE) {
       const voice = item.voice_item;
-      if (voice?.text?.trim()) {
-        transcript = voice.text.trim();
+      if (voiceText) {
+        transcript = voiceText;
         lines.push(`[语音转写] ${transcript}`);
+        if (reportedType !== MessageItemType.VOICE || !voice?.media) continue;
       }
+      if (!voice?.media) report('voice-item-without-media');
       const seconds = Number(voice?.playtime ?? 0);
       const secondsText = seconds > 0 ? `${(seconds / 1000).toFixed(1)} 秒` : '时长未知';
       if (!opts.downloadVoice) {
@@ -274,9 +299,11 @@ export async function renderInbound(
       continue;
     }
     if (type === MessageItemType.TOOL_CALL_START || type === MessageItemType.TOOL_CALL_RESULT) {
+      report('skipped-tool-item');
       continue;
     }
-    if (type) lines.push(`[不支持的消息类型 ${type}]`);
+    report('unsupported-item-type');
+    if (type !== undefined && type !== 0) lines.push(`[不支持的消息类型 ${type}]`);
   }
 
   return {
