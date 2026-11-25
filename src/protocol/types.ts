@@ -241,6 +241,7 @@ export type QrStatus =
   | 'expired'
   | 'scaned_but_redirect'
   | 'need_verifycode'
+  | 'confirmed_but_need_verifycode'
   | 'verify_code_blocked'
   | 'binded_redirect';
 

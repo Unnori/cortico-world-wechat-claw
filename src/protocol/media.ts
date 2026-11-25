@@ -140,13 +140,24 @@ export class MediaTransfer {
     /** 入站图片另有明文十六进制密钥，优先于 media.aes_key。 */
     aesKeyHex?: string;
     maxBytes?: number;
+    /** 引用内嵌的地址只从配置的 CDN 下载。 */
+    cdnOnly?: boolean;
   }): Promise<{ bytes: Buffer; decrypted: boolean }> {
-    const fullUrl = String(params.fullUrl ?? '').trim();
+    let fullUrl = String(params.fullUrl ?? '').trim();
     const queryParam = String(params.encryptedQueryParam ?? '').trim();
+    if (params.cdnOnly && fullUrl) {
+      const url = URL.parse(fullUrl);
+      const cdn = new URL(this.#cdnBaseUrl);
+      if (!url || url.origin !== cdn.origin || url.username || url.password || url.pathname !== `${cdn.pathname.replace(/\/$/, '')}/download`) fullUrl = '';
+    }
     if (!fullUrl && !queryParam) throw new Error('媒体引用里没有下载参数');
     const url = fullUrl || buildCdnDownloadUrl(queryParam, this.#cdnBaseUrl);
 
     const init: FetchInit = { method: 'GET' };
+    if (params.cdnOnly) {
+      init.redirect = 'error';
+      init.signal = AbortSignal.timeout(15_000);
+    }
     if (this.#dispatcher) init.dispatcher = this.#dispatcher;
     const response = await this.#fetchImpl(url, init);
     if (!response.ok) {

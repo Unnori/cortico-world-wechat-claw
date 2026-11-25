@@ -39,6 +39,8 @@ export interface WechatClawConfigSection extends TtsSettings {
   forceIpv4: boolean;
   /** 微信私聊消息在 Core 中的投递方式，提交事件时读取。 */
   inboundTrigger: TriggerMode;
+  imageCaptionWindowSec: number;
+  nativeProgressEnabled: boolean;
   /** 收图时是否下载并交给模型看。 */
   receiveImages: boolean;
   /** 收文件时是否下载。 */
@@ -121,6 +123,8 @@ export const WECHAT_CLAW_DEFAULTS: WechatClawConfigSection = {
   proxyUrl: '',
   forceIpv4: false,
   inboundTrigger: DEFAULT_INBOUND_TRIGGER,
+  imageCaptionWindowSec: 0,
+  nativeProgressEnabled: false,
   receiveImages: true,
   receiveFiles: true,
   receiveVideos: false,
@@ -186,6 +190,16 @@ const CONFIG_FIELDS = {
     description: '立即投递结束合批等待。抢占只取消尚未输出且没有工具正在执行的请求。打断立即停止当前轮。随下一批投递等待其他事件唤醒。',
     enum: Object.keys(INBOUND_TRIGGERS),
     'x-options': INBOUND_TRIGGER_OPTIONS,
+    'x-hot': true,
+  },
+  imageCaptionWindowSec: {
+    type: 'number', title: '图片等待补充说明（秒）', minimum: 0, maximum: 5,
+    description: '纯图片消息会短暂等待，收到紧接的文字就一起投递。0 为关闭。放行后仍使用上面选定的投递方式。',
+    'x-hot': true,
+  },
+  nativeProgressEnabled: {
+    type: 'boolean', title: '试用微信任务进度卡',
+    description: '仅为微信发起的长工具任务显示通用进度。与正文共用回复额度，实际显示以手机微信为准。',
     'x-hot': true,
   },
   receiveImages: {
@@ -298,7 +312,7 @@ const CONFIG_GROUPS = [
     id: 'world:wechat-claw',
     zh: '消息投递与回复',
     en: 'Messages and replies',
-    fields: ['inboundTrigger', 'segmentEnabled', 'segmentPace', 'segmentMaxParts', 'segmentMaxTotalSec', 'nativeVoiceEnabled'],
+    fields: ['inboundTrigger', 'imageCaptionWindowSec', 'segmentEnabled', 'segmentPace', 'segmentMaxParts', 'segmentMaxTotalSec'],
   },
   {
     id: 'world:wechat-claw:attachments',
@@ -317,6 +331,12 @@ const CONFIG_GROUPS = [
     zh: '微信网络',
     en: 'WeChat network',
     fields: ['networkMode', 'proxyUrl', 'forceIpv4'],
+  },
+  {
+    id: 'world:wechat-claw:debug',
+    zh: '调试',
+    en: 'Debug',
+    fields: ['nativeProgressEnabled', 'nativeVoiceEnabled'],
   },
 ] as const satisfies readonly { id: string; zh: string; en: string; fields: readonly (keyof typeof CONFIG_FIELDS)[] }[];
 

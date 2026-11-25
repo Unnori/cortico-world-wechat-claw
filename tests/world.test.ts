@@ -7,11 +7,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import type { EventEnvelope, PushOptions, ToolCallContext, WorldHost } from 'cortico/core/types.ts';
 import { coerceGroupValues, setByPath } from 'cortico/core/config-schema.ts';
 import { blobLine, LogBlobStore } from 'cortico/core/blobs.ts';
+import { JsonlEventStore } from 'cortico/core/event-store.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 
 import { WECHAT_CLAW } from '../src/definition.ts';
@@ -225,7 +226,10 @@ describe('定义与声明', () => {
   it('通用配置按用途分组，TTS 字段只在专用面板出现', () => {
     const groups = wechatClawConfigGroups('zh');
     expect(groups.map(group => group.schema.title)).toEqual([
-      '消息投递与回复', '附件收发', '图片与视频', '微信网络',
+      '消息投递与回复', '附件收发', '图片与视频', '微信网络', '调试',
+    ]);
+    expect(Object.keys(groups.at(-1)!.schema.properties)).toEqual([
+      'worlds.wechat-claw.nativeProgressEnabled', 'worlds.wechat-claw.nativeVoiceEnabled',
     ]);
     expect(groups.every(group => group.owner === 'world:wechat-claw')).toBe(true);
     const paths = groups.flatMap(group => Object.keys(group.schema.properties));
@@ -592,20 +596,23 @@ describe('入站消息', () => {
     });
     const host = new FakeHost();
     await world.start(host);
-    // 给解析留出时间，确认它不会去下 ffmpeg。
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    try {
+      // 给启动时的 FFmpeg 检测留出时间。
+      await new Promise((resolve) => setTimeout(resolve, 300));
 
-    const binDir = join(scratchDir, 'wechat-claw', 'bin');
-    // 启动阶段不该建 bin 目录，更不该有 ffmpeg。
-    expect(existsSync(join(binDir, 'ffmpeg.exe'))).toBe(false);
+      const binDir = join(scratchDir, 'wechat-claw', 'bin');
+      expect(existsSync(binDir)).toBe(false);
 
-    // 面板状态能读到：没装、不可用、也没在装。
-    const invoke = world.webUi('zh').invoke!;
-    const state = await invoke('binding', 'ffmpeg-state', []) as Record<string, unknown>;
-    expect(state.installed).toBe(false);
-    expect(state.installing).toBe(false);
-    expect(state.ready).toBe(false);
-    await world.stop();
+      // auto 可以使用 PATH 里已有的 FFmpeg。面板的安装状态只记录扩展自己的下载。
+      const invoke = world.webUi('zh').invoke!;
+      const state = await invoke('binding', 'ffmpeg-state', []) as Record<string, unknown>;
+      expect(state.installed).toBe(false);
+      expect(state.installing).toBe(false);
+      expect(['none', 'path']).toContain(state.origin);
+      expect(state.ready).toBe(state.origin === 'path');
+    } finally {
+      await world.stop();
+    }
   });
 
   it('FFmpeg 和 TTS 嵌入连接面板，FFmpeg 仍能取消下载', async () => {
@@ -680,6 +687,28 @@ describe('入站消息', () => {
     await waitFor(() => Boolean((world.envPromptVars()['wechat.state'])), 3000);
     await invoke('binding', 'cancel', []);
     await world.stop();
+  });
+
+  it('扫码兼容复合 PIN 状态，错码后等待新输入，锁定后换码且不重用旧 PIN', async () => {
+    const srv = await startFakeServer({ qrStatuses: ['confirmed_but_need_verifycode', 'need_verifycode', 'verify_code_blocked', 'confirmed'] });
+    server = srv;
+    const world = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    await world.start(new FakeHost());
+    const invoke = world.webUi('zh').invoke!;
+    const state = async () => await invoke('binding', 'state', []) as Record<string, unknown>;
+    const polls = () => srv.requests.filter(req => req.path.endsWith('/get_qrcode_status'));
+    try {
+      await invoke('binding', 'start', []);
+      await vi.waitFor(async () => expect(await state()).toMatchObject({ verifyRequired: true }), { timeout: 3000 });
+      expect(polls()).toHaveLength(1);
+      await invoke('binding', 'verify', ['111111']);
+      await vi.waitFor(async () => expect(await state()).toMatchObject({ verifyRequired: true, loginError: expect.stringContaining('未通过') }), { timeout: 3000 });
+      expect(polls()).toHaveLength(2);
+      await invoke('binding', 'verify', ['222222']);
+      await vi.waitFor(async () => expect(await state()).toMatchObject({ bound: true, verifyRequired: false }), { timeout: 5000 });
+      expect(srv.requests.filter(req => req.path.endsWith('/get_bot_qrcode'))).toHaveLength(2);
+      expect(polls().map(req => new URLSearchParams(req.query).get('verify_code'))).toEqual([null, '111111', '222222', null]);
+    } finally { await world.stop(); }
   });
 
   it('面板给的是本地时间，不是 UTC 钟点', async () => {
@@ -841,6 +870,208 @@ describe('出站发送与配额', () => {
   const texts = (srv: FakeServer): string[] =>
     srv.sent.map((msg) => String((msg.item_list as Array<{ text_item?: { text?: string } }>)[0]?.text_item?.text ?? ''));
 
+  const typingRequests = (srv: FakeServer) => srv.requests
+    .filter(req => req.path === '/ilink/bot/sendtyping')
+    .map(req => JSON.parse(req.body) as { status: number; ilink_user_id: string; typing_ticket: string });
+  const typingStatuses = (srv: FakeServer) => typingRequests(srv).map(req => req.status);
+
+  function pauseResponse() {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    return { pending, release };
+  }
+
+  const inbound = (id: string, items: unknown[]) => ({
+    from_user_id: 'wx-user@im.wechat', message_type: 1, message_id: id, context_token: `ctx-${id}`, item_list: items,
+  });
+  const textItem = (text: string) => ({ type: 1, text_item: { text } });
+
+  function inboundPicture(srv: FakeServer, id: string) {
+    const key = randomBytes(16);
+    const bytes = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('fake image for quote')]);
+    srv.uploads.set(id, { ciphertext: encryptForTest(bytes, key), key });
+    return { type: 2, image_item: { media: {
+      encrypt_query_param: `download-param-${id}`, aes_key: Buffer.from(key.toString('hex')).toString('base64'),
+    } } };
+  }
+
+  it('只带嵌套消息 ID 的引用可以从旧 run 的 Core 归档恢复真实图片', async () => {
+    const { srv, world, host } = await ready({ inboundTrigger: 'preempt' });
+    const originals = new JsonlEventStore({ dataDir: scratchDir, run: 'r-20261123-120230-0001' });
+    const blobStore = new LogBlobStore(scratchDir);
+    const originalId = '9007199254741789001';
+    const bytes = Buffer.from('ffd8ffe000104a46494600010200000100010000ffd9', 'hex');
+    const image = { handle: blobStore.put(bytes, 'image/jpeg'), mime: 'image/jpeg', name: 'old.jpg', fallbackText: '[图片]' };
+    const priorQuote = { ...image, handle: blobStore.put(Buffer.from('other quoted image'), 'image/jpeg') };
+    const media = { kind: 'image', mime: 'image/jpeg', name: 'old.jpg', bytes: bytes.length, delivery: 'native', attachedMimes: ['image/jpeg'] };
+    const raw = { ...inbound(originalId, [{ type: 2, msg_id: '9007199254741789002' }]), to_user_id: 'bot-account@im.bot' };
+    delete (raw as { context_token?: string }).context_token;
+    const archived = {
+      type: EVENT_MESSAGE, ts: '2026-11-23T12:03:00+08:00', source: 'wechat-claw', origin: 'external' as const,
+      senderKey: 'wx-user@im.wechat', text: '[图片]',
+      meta: { raw, media: [media, { ...media, quoted: true }] },
+      blobs: [image, priorQuote],
+    };
+    originals.append(archived);
+    originals.append({ ...archived, meta: { ...archived.meta, bindingAccount: 'previous-account' }, blobs: [priorQuote, priorQuote] });
+    host.store = new JsonlEventStore({ dataDir: scratchDir, run: 'r-20261124-104825-0001' });
+    host.blob = handle => blobStore.read(handle);
+    try {
+      srv.queue.push(inbound('7030', [{
+        ...textItem('你看到我引用的是什么了吗'), ref_msg: { message_item: { type: 0, msg_id: originalId } },
+      }]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(1));
+      const event = host.events[0];
+      expect(event.text).toMatch(/回复 \[引用附件 .*?\].*你看到我引用的是什么了吗/);
+      expect(event.blobs).toEqual([expect.objectContaining({ bytes: new Uint8Array(bytes), mime: 'image/jpeg' })]);
+      expect(event.meta?.media).toEqual([expect.objectContaining({ quoted: true, delivery: 'native' })]);
+      expect(host.pushOptions[0]?.trigger).toBe('preempt');
+      expect(srv.requests.some(req => req.path === '/cdn/download')).toBe(false);
+      const status = JSON.parse(await world.tools().find(tool => tool.name === 'wechat_status')!.handler({}, call) as string);
+      expect(status.lastInboundAttachments).toEqual([expect.objectContaining({ quoted: true, attachedMimes: ['image/jpeg'] })]);
+
+      host.acceptImages = false;
+      srv.queue.push(inbound('7033', [{
+        ...textItem('换成纯文本模型后继续'), ref_msg: { message_item: { type: 0, msg_id: originalId } },
+      }]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(2));
+      expect(host.events[1].text).toMatch(/当前 Provider 不接受 image\/jpeg 输入。\n\[引用附件已存为 /);
+      expect(host.events[1].blobs).toBeUndefined();
+      expect(host.events[1].meta?.media).toEqual([expect.objectContaining({ quoted: true, delivery: 'omitted' })]);
+    } finally { await world.stop(); }
+  });
+
+  it('引用内嵌的 CDN 附件可直接取回，无 ID 时也能下载；不请求其他地址', async () => {
+    const { srv, world, host } = await ready();
+    try {
+      const item = inboundPicture(srv, 'inline-quote');
+      const { encrypt_query_param } = item.image_item.media;
+      srv.queue.push(inbound('7031', [{ ...textItem('这是什么'), ref_msg: { message_item: {
+        ...item, image_item: { media: {
+          aes_key: item.image_item.media.aes_key,
+          full_url: `${srv.cdnBaseUrl}/download?encrypted_query_param=${encrypt_query_param}`,
+        } },
+      } } }]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(1));
+      expect(host.events[0].blobs).toEqual([expect.objectContaining({ mime: 'image/png' })]);
+      expect(host.events[0].meta?.media).toMatchObject([{ quoted: true, delivery: 'native' }]);
+      expect(srv.requests.filter(req => req.path === '/cdn/download')).toHaveLength(1);
+
+      srv.queue.push(inbound('7032', [{ ...textItem('正文照常到达'), ref_msg: { message_item: {
+        type: 2, image_item: { media: { full_url: `${srv.baseUrl}/outside-cdn` } },
+      } } }]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(2));
+      expect(host.events[1].text).toMatch(/附件未能取回.*正文照常到达/);
+      expect(host.events[1].blobs).toBeUndefined();
+      expect(srv.requests.some(req => req.path === '/outside-cdn')).toBe(false);
+    } finally { await world.stop(); }
+  });
+
+  it('热开启图片等待后合并说明、读取最新投递模式和引用单张旧图；普通文字无额外等待', async () => {
+    const { srv, world, host, config, send } = await ready({ inboundTrigger: 'debounce' });
+    const events = () => host.events.filter(event => event.type === EVENT_MESSAGE);
+    try {
+      srv.queue.push(inbound('7000', [textItem('原有普通文本')]));
+      await vi.waitFor(() => expect(events()).toHaveLength(1));
+      expect(host.pushOptions[0]?.trigger).toBe('debounce');
+      config.imageCaptionWindowSec = 3;
+      srv.queue.push(inbound('9007199254741001', [inboundPicture(srv, 'one')]), inbound('9007199254741002', [inboundPicture(srv, 'two')]));
+      await vi.waitFor(() => expect(srv.queue).toHaveLength(0));
+      expect(events()).toHaveLength(1);
+      config.inboundTrigger = 'preempt';
+      srv.queue.push(inbound('7001', [textItem('比较上面两张图')]));
+      await vi.waitFor(() => expect(events()).toHaveLength(2), { timeout: 1500 });
+      expect(events()[1]).toMatchObject({ text: expect.stringContaining('比较上面两张图'), meta: { imageCaptionBatch: 3 } });
+      expect(events()[1].blobs).toHaveLength(2);
+      expect(host.pushOptions[1]?.trigger).toBe('preempt');
+      await send.handler({ text: '好' }, call);
+      expect(srv.sent.at(-1)?.context_token).toBe('ctx-7001');
+      srv.queue.push(inbound('7002', [{ ...textItem('只看第一张'), ref_msg: { svr_id: '9007199254741001' } }]));
+      await vi.waitFor(() => expect(events()).toHaveLength(3));
+      expect(events()[2].blobs).toHaveLength(1);
+      expect(events()[2].meta?.media).toMatchObject([{ quoted: true, delivery: 'native' }]);
+      const oldPath = events()[1].text.match(/已存为 ([^\]]+)\]/)?.[1];
+      expect(oldPath).toBeTruthy();
+      rmSync(oldPath!);
+      srv.queue.push(inbound('7003', [{ ...textItem('图片不存在时也继续'), ref_msg: { svr_id: '9007199254741001' } }]));
+      await vi.waitFor(() => expect(events()).toHaveLength(4));
+      expect(events()[3].text).toMatch(/引用附件已删除或变更.*图片不存在时也继续/);
+      expect(events()[3].blobs).toBeUndefined();
+    } finally { await world.stop(); }
+  });
+
+  it('图片等不到说明就放行，停用时也放行尚未到期的待投图片', async () => {
+    const { srv, world, host, config } = await ready({ imageCaptionWindowSec: 0.2, inboundTrigger: 'interrupt' });
+    try {
+      srv.queue.push(inbound('7010', [inboundPicture(srv, 'timeout') ]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(1));
+      expect(host.pushOptions[0]?.trigger).toBe('interrupt');
+      config.imageCaptionWindowSec = 4;
+      srv.queue.push(inbound('7011', [inboundPicture(srv, 'shutdown')]));
+      await vi.waitFor(() => expect(srv.queue).toHaveLength(0));
+      expect(host.events).toHaveLength(1);
+      await world.stop();
+      expect(host.events).toHaveLength(2);
+    } finally { await world.stop(); }
+  });
+
+  it('通过出站 ID 在重启后还原局部引用，只投递匹配的原文片段', async () => {
+    const { srv, world, send } = await ready({ segmentEnabled: false });
+    const selected = '开头重点结束';
+    const text = `上下文结束。${selected}，另有其它信息。`;
+    try { await send.handler({ text }, call); } finally { await world.stop(); }
+    const persisted = readFileSync(join(scratchDir, 'wechat-claw', 'quote-index.json'), 'utf8');
+    expect(persisted).not.toMatch(/bot-token-123|ctx-1|aes_key/);
+    const restored = makeWorld({ cfg: { ...WECHAT_CLAW_DEFAULTS }, dataDir: scratchDir, server: srv });
+    const host = new FakeHost();
+    await restored.start(host);
+    try {
+      srv.queue.push(inbound('7012', [{ ...textItem('关于这段'), ref_msg: { svr_id: '9007199254740993', partial_text: {
+        start: '开头', end: '结束', startindex: 0, endindex: 0, quotemd5: createHash('md5').update(selected).digest('hex'),
+      } } }]));
+      await vi.waitFor(() => expect(host.events[0]?.meta?.quote).toBe(selected));
+      expect(host.events[0].text).not.toContain('其它信息');
+    } finally { await restored.stop(); }
+  });
+
+  it('诊断指令只给绑定本人回一条，归档但不投递模型', async () => {
+    const { srv, world, host } = await ready({ inboundTrigger: 'preempt', imageCaptionWindowSec: 4 });
+    try {
+      const outsider = { ...inbound('7020', [textItem('/状态')]), from_user_id: 'not-owner@im.wechat' };
+      srv.queue.push(outsider, inbound('7021', [textItem('/状态')]), inbound('7022', [textItem('/echo hello')]), inbound('7023', [textItem('/other') ]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(3));
+      expect(texts(srv)).toHaveLength(2);
+      expect(texts(srv)[0]).toContain('未调用模型');
+      expect(texts(srv)[1]).toMatch(/^hello\n微信/);
+      expect(srv.sent.map(msg => msg.context_token)).toEqual(['ctx-7021', 'ctx-7022']);
+      expect(host.pushOptions.map(opts => [opts?.deliver, opts?.trigger])).toEqual([[false, undefined], [false, undefined], [true, 'preempt']]);
+    } finally { await world.stop(); }
+  });
+
+  it.each([false, true])('试验进度配对且不带内部工具名，网关拒绝进度=%s 时仍发送正文', async (rejectedStart) => {
+    const { srv, world, host, send } = await ready({ nativeProgressEnabled: true, segmentPace: 0 });
+    const phase = { state: 'tools' as const, round: 1, enteredAt: new Date().toISOString(), running: ['private_tool_name'] };
+    try {
+      srv.queue.push(inbound('7030', [textItem('请做一个长任务')]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(1));
+      if (rejectedStart) { srv.nextSendRet = -2; srv.nextSendErrmsg = 'prepare failed'; }
+      world.onEventsSettled(host.events, 'delivered');
+      world.onRunPhase(phase);
+      const attempts = () => srv.requests.filter(req => req.path.endsWith('/sendmessage'));
+      await vi.waitFor(() => expect(attempts()).toHaveLength(1), { timeout: 3500 });
+      world.onRunPhase({ ...phase, running: [] });
+      if (!rejectedStart) await vi.waitFor(() => expect(srv.sent).toHaveLength(2));
+      await send.handler({ text: '完成了' }, call);
+      expect(texts(srv).at(-1)).toBe('完成了');
+      const types = srv.sent.map(msg => (msg.item_list as Array<{ type: number }>)[0].type);
+      expect(types).toEqual(rejectedStart ? [1] : [11, 12, 1]);
+      expect(JSON.stringify(srv.sent)).not.toContain('private_tool_name');
+      if (!rejectedStart) expect(srv.sent.every(msg => msg.run_id && msg.run_id === srv.sent[0].run_id)).toBe(true);
+      const quota = JSON.parse(readFileSync(join(scratchDir, 'wechat-claw', 'context-tokens.json'), 'utf8'));
+      expect(quota['wx-user@im.wechat'].sent).toBe(rejectedStart ? 1 : 3);
+    } finally { await world.stop(); }
+  });
+
   async function audioFile(world: WechatClawWorld, name: string, bytes: Buffer): Promise<string> {
     const status = world.tools().find(t => t.name === 'wechat_status')!;
     const workspace = JSON.parse(String(await status.handler({}, call))).workspace;
@@ -898,7 +1129,7 @@ describe('出站发送与配额', () => {
     const path = await audioFile(world, 'audio.mp3', mp3);
     const voice = world.tools().find(t => t.name === 'wechat_send_voice')!;
     try {
-      const group = wechatClawConfigGroups('zh').find(group => group.id === 'world:wechat-claw');
+      const group = wechatClawConfigGroups('zh').find(group => group.id === 'world:wechat-claw:debug');
       expect(group?.schema.properties['worlds.wechat-claw.nativeVoiceEnabled']['x-hot']).toBe(true);
       expect(config.nativeVoiceEnabled).toBe(false);
       expect(await voice.handler({ path }, call)).toContain('MP3 音频文件');
@@ -1263,6 +1494,150 @@ describe('出站发送与配额', () => {
     expect(receipt).toContain('共等待');
     expect(texts(srv)).toEqual([text]);
     await world.stop();
+    expect(typingStatuses(srv)).toEqual([1, 2]);
+    expect(typingRequests(srv)[1]).toMatchObject({
+      ilink_user_id: typingRequests(srv)[0].ilink_user_id,
+      typing_ticket: typingRequests(srv)[0].typing_ticket,
+    });
+  });
+
+  it('单纯收信和立即发送短句都不触发输入提示', async () => {
+    const { srv, world, host, send } = await ready({}, { batches: [[{
+      from_user_id: 'wx-user@im.wechat', message_type: 1, message_id: '123', context_token: 'ctx-2',
+      item_list: [{ type: 1, text_item: { text: '测试入站' } }],
+    }]] });
+    try {
+      await vi.waitFor(() => expect(host.events.some(event => event.type === EVENT_MESSAGE)).toBe(true));
+      await send.handler({ text: '好' }, call);
+    } finally { await world.stop(); }
+    expect(texts(srv)).toEqual(['好']);
+    expect(srv.requests.some(req => req.path === '/ilink/bot/getconfig')).toBe(false);
+    expect(typingStatuses(srv)).toEqual([]);
+  });
+
+  it('微信轮等待模型即提示，工具发送期间每隔一段时间刷新，最后一段发完才取消', async () => {
+    const lastPart = pauseResponse();
+    let attempts = 0;
+    const { srv, world, host, send } = await ready({ segmentPace: 0.5 }, {
+      beforeSend: async () => { if (++attempts === 2) await lastPart.pending; },
+    });
+    const model = { state: 'model' as const, round: 1, running: [], enteredAt: new Date().toISOString() };
+    const tools = { ...model, state: 'tools' as const, running: ['wechat_send'] };
+    try {
+      world.onRunPhase(model); // 桌面侧本身在运行，没有微信消息投递。
+      srv.queue.push(inbound('7050', [textItem('请回复两段')]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(1));
+      expect(typingStatuses(srv)).toEqual([]);
+      world.onEventsSettled(host.events, 'delivered');
+      world.onRunPhase(model);
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1]));
+      expect(srv.sent).toEqual([]);
+      world.onRunPhase(tools);
+      const sending = send.handler({ text: `${'甲'.repeat(30)}\n${'乙'.repeat(30)}` }, call);
+      await vi.waitFor(() => expect(attempts).toBe(2));
+      expect(srv.sent).toHaveLength(1);
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1, 1]), { timeout: 7000 });
+      lastPart.release();
+      await sending;
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1, 1, 2]));
+      expect(srv.sent).toHaveLength(2);
+      world.onRunPhase({ ...model, round: 2 });
+      world.onTurnEnded();
+    } finally {
+      lastPart.release();
+      await world.stop();
+    }
+    expect(typingStatuses(srv)).toEqual([1, 1, 2]);
+  });
+
+  it('推理没有发消息时，静止超时停止提示；新的运行阶段可恢复，随后轮次切换会关闭', async () => {
+    const { srv, world, host } = await ready();
+    const model = { state: 'model' as const, round: 1, running: [], enteredAt: new Date().toISOString() };
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      srv.queue.push(inbound('7051', [textItem('还在等')]));
+      await vi.waitFor(() => expect(host.events).toHaveLength(1));
+      world.onEventsSettled(host.events, 'delivered');
+      world.onRunPhase(model);
+      const expiry = timers.mock.calls.find((call) => call[1] === 120_000)?.[0];
+      expect(typeof expiry).toBe('function');
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1]));
+      expiry!();
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1, 2]));
+      world.onRunPhase({ ...model, state: 'tools', running: ['read'] });
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1, 2, 1]));
+      world.onRunPhase({ ...model, state: 'delivering' });
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1, 2, 1, 2]));
+    } finally { timers.mockRestore(); await world.stop(); }
+    expect(srv.sent).toEqual([]);
+  });
+
+  it('取票晚于节奏等待时直接发正文，不迟到开启提示', async () => {
+    const ticket = pauseResponse();
+    const { srv, world, send } = await ready({ segmentPace: 0.5 }, { beforeGetConfig: () => ticket.pending });
+    const text = '甲'.repeat(30);
+    try {
+      const sending = send.handler({ text }, call);
+      await vi.waitFor(() => expect(srv.requests.some(req => req.path === '/ilink/bot/getconfig')).toBe(true));
+      await sending;
+      expect(texts(srv)).toEqual([text]);
+    } finally {
+      ticket.release();
+      await world.stop();
+    }
+    expect(typingStatuses(srv)).toEqual([]);
+  });
+
+  it('开始状态的请求仍在进行时不阻塞正文，结束后按顺序补发取消', async () => {
+    const opening = pauseResponse();
+    const { srv, world, send } = await ready({ segmentPace: 0.5 }, {
+      beforeTyping: async (status) => { if (status === 1) await opening.pending; },
+    });
+    const text = '甲'.repeat(30);
+    try {
+      const sending = send.handler({ text }, call);
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1]));
+      await sending;
+      expect(texts(srv)).toEqual([text]);
+      expect(typingStatuses(srv)).toEqual([1]);
+      opening.release();
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1, 2]));
+    } finally {
+      opening.release();
+      await world.stop();
+    }
+  });
+
+  it.each(['abort', 'stop', 'unbind'] as const)('节奏等待被 %s 结束时取消输入且不发送正文', async (action) => {
+    const { srv, world, send } = await ready({ segmentPace: 5 });
+    const controller = new AbortController();
+    const sending = send.handler({ text: '甲'.repeat(30) }, { ...call, signal: controller.signal });
+    const rejected = expect(sending).rejects.toThrow(action === 'abort' ? /turn aborted/ : /微信连接已停止/);
+    try {
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1]));
+      if (action === 'abort') controller.abort(new Error('turn aborted'));
+      else if (action === 'stop') await world.stop();
+      else await world.webUi('zh').invoke!('binding', 'unbind', []);
+      await rejected;
+      await vi.waitFor(() => expect(typingStatuses(srv)).toEqual([1, 2]));
+      expect(texts(srv)).toEqual([]);
+    } finally { await world.stop(); }
+  });
+
+  it('即使正文发送失败也清除提示；取消被拒绝时只记录错误码', async () => {
+    const { srv, world, host, send } = await ready({ segmentPace: 0.5 }, {
+      beforeTyping: async (status) => status === 2 ? { ret: 8, errmsg: 'private-typing-data' } : undefined,
+    });
+    const warn = vi.fn();
+    host.log.warn = warn;
+    srv.nextSendRet = 2;
+    try {
+      await expect(send.handler({ text: '甲'.repeat(30) }, call)).rejects.toThrow(/send refused/);
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(expect.stringContaining('输入状态'),
+        expect.objectContaining({ action: 'cancel', ret: 8 })));
+      expect(typingStatuses(srv)).toEqual([1, 2]);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('private-typing-data');
+    } finally { await world.stop(); }
   });
 
   it('关掉分段就恢复成一条发完、不等', async () => {

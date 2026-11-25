@@ -17,6 +17,7 @@ export interface RecordedRequest {
   path: string;
   headers: IncomingMessage['headers'];
   body: string;
+  query?: string;
 }
 
 export interface FakeMessage {
@@ -37,6 +38,8 @@ export interface FakeServerOptions {
   /** 每个 context_token 允许成功发送的条数。 */
   maxRepliesPerContext?: number;
   beforeSend?: (message: Record<string, unknown>) => Promise<void>;
+  beforeGetConfig?: () => Promise<void>;
+  beforeTyping?: (status: number) => Promise<{ ret: number; errmsg?: string } | void>;
   /** 收消息时一次给多少批；给空数组就一直返回空批次。 */
   batches?: FakeMessage[][];
   /** 二维码状态序列；默认直接 confirmed。 */
@@ -56,6 +59,7 @@ export interface FakeServer {
   queue: FakeMessage[];
   /** 下一次 sendmessage 的响应码，用来测错误路径。 */
   nextSendRet: number | null;
+  nextSendErrmsg?: string;
   /** 下一次 getupdates 返回的业务错误。 */
   nextUpdatesError: { ret?: number; errcode?: number; errmsg?: string } | null;
   close(): Promise<void>;
@@ -101,7 +105,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     const rawBody = await readBody(req);
     const body = rawBody.toString('utf8');
-    requests.push({ method: req.method ?? 'GET', path: url.pathname, headers: req.headers, body });
+    requests.push({ method: req.method ?? 'GET', path: url.pathname, headers: req.headers, body, query: url.search });
 
     if (url.pathname === '/audio/speech' && opts.speechWav) {
       res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': opts.speechWav.length });
@@ -180,7 +184,8 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       if (state.nextSendRet !== null) {
         const ret = state.nextSendRet;
         state.nextSendRet = null;
-        sendJson(res, { ret, errmsg: 'send refused' });
+        sendJson(res, { ret, errmsg: state.nextSendErrmsg ?? 'send refused' });
+        state.nextSendErrmsg = undefined;
         return;
       }
       const parsed = JSON.parse(body) as { msg?: Record<string, unknown> };
@@ -219,10 +224,16 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       return;
     }
     if (url.pathname === '/ilink/bot/getconfig') {
+      await opts.beforeGetConfig?.();
       sendJson(res, { ret: 0, typing_ticket: 'typing-ticket' });
       return;
     }
-    if (url.pathname === '/ilink/bot/sendtyping' || url.pathname.startsWith('/ilink/bot/msg/notify')) {
+    if (url.pathname === '/ilink/bot/sendtyping') {
+      const { status } = JSON.parse(body) as { status: number };
+      sendJson(res, (await opts.beforeTyping?.(status)) ?? { ret: 0 });
+      return;
+    }
+    if (url.pathname.startsWith('/ilink/bot/msg/notify')) {
       sendJson(res, { ret: 0 });
       return;
     }

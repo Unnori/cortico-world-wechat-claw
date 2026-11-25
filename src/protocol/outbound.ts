@@ -51,6 +51,21 @@ export function textMessage(params: {
   });
 }
 
+export function progressMessage(params: {
+  to: string; contextToken: string; runId: string; phase: 'start' | 'end';
+}): WeixinMessage {
+  const start = params.phase === 'start';
+  const tool = { tool_name: '处理请求', tool_call_id: params.runId };
+  return {
+    ...envelope({ ...params, item: {
+      type: start ? MessageItemType.TOOL_CALL_START : MessageItemType.TOOL_CALL_RESULT,
+      create_time_ms: Date.now(), is_completed: !start,
+      ...(start ? { tool_call_start_item: tool } : { tool_call_result_item: { ...tool, status: 'unknown' } }),
+    } }),
+    run_id: params.runId,
+  };
+}
+
 /** 图片项：`mid_size` 填密文字节数，密钥按十六进制字符串再 base64。 */
 export function imageMessage(params: {
   to: string;

@@ -31,6 +31,8 @@ export interface InboundMedia {
   /** 图片的真实像素尺寸；读不出文件头时缺省。 */
   width?: number;
   height?: number;
+  /** 已归档的视频抽帧图，仍按图片输入投递。 */
+  videoFrames?: true;
 }
 
 /** 一条入站消息渲染后的结果。 */
@@ -82,7 +84,7 @@ export function sanitizeRaw(msg: WeixinMessage): WeixinMessage {
   return copy;
 }
 
-/** 被引用消息的摘要；新版客户端只给 ID 时返回空串。 */
+/** 被引用消息的摘要；只给 ID 时保留占位，等 World 查询历史。 */
 export function quoteSummary(item: MessageItem | undefined): string {
   const ref = item?.ref_msg;
   if (!ref) return '';
@@ -90,11 +92,12 @@ export function quoteSummary(item: MessageItem | undefined): string {
   if (typeof ref.title === 'string' && ref.title.trim()) parts.push(ref.title.trim());
   const inner = ref.message_item;
   if (inner) {
-    if (inner.type === MessageItemType.TEXT) parts.push(String(inner.text_item?.text ?? '').trim());
-    else if (inner.type === MessageItemType.IMAGE) parts.push('[图片]');
-    else if (inner.type === MessageItemType.FILE) parts.push(`[文件 ${inner.file_item?.file_name ?? ''}]`.trim());
-    else if (inner.type === MessageItemType.VIDEO) parts.push('[视频]');
-    else if (inner.type === MessageItemType.VOICE) parts.push('[语音]');
+    const type = inboundWireType(inner.type);
+    if (type === MessageItemType.TEXT) parts.push(String(inner.text_item?.text ?? '').trim());
+    else if (type === MessageItemType.IMAGE) parts.push('[图片]');
+    else if (type === MessageItemType.FILE) parts.push(`[文件 ${inner.file_item?.file_name ?? ''}]`.trim());
+    else if (type === MessageItemType.VIDEO) parts.push('[视频]');
+    else if (type === MessageItemType.VOICE) parts.push('[语音]');
   }
   const text = parts.filter(Boolean).join(' | ');
   if (text) return text;
@@ -141,6 +144,7 @@ export interface RenderOptions {
   downloadVideo: boolean;
   /** 单条媒体字节上限；超过就只留占位。 */
   maxBytes: number;
+  cdnOnly?: boolean;
 }
 
 /**
@@ -149,8 +153,8 @@ export interface RenderOptions {
  * 名字先按「原文名 + 时间戳」生成，撞名再退到 `-2`、`-3`；写入用 `wx` 独占标志，
  * 万一在查重和写入之间被别人占了名字，就换一个再写，不覆盖已有文件。
  */
-async function saveMedia(params: {
-  bytes: Buffer;
+export async function saveMedia(params: {
+  bytes: Uint8Array;
   dir: string;
   name: string;
 }): Promise<string> {
@@ -167,6 +171,14 @@ async function saveMedia(params: {
     }
   }
   throw new Error(`收件目录里放不下 ${params.name}`);
+}
+
+/** Quotes may contain downloadable media even without a server message ID. */
+export function renderQuotedMedia(item: MessageItem | undefined, opts: RenderOptions): Promise<RenderedInbound> | undefined {
+  if (item && [item.image_item, item.file_item, item.video_item, item.voice_item].some(part =>
+    part?.media && (part.media.encrypt_query_param || part.media.full_url))) {
+    return renderInbound({ item_list: [item] }, { ...opts, cdnOnly: true });
+  }
 }
 
 /** 取不到附件时给模型的一句话，按原因区分。 */
@@ -338,6 +350,7 @@ async function fetchItem(
         aesKeyBase64: ref.aes_key,
         aesKeyHex: img?.aeskey,
         maxBytes: opts.maxBytes,
+        cdnOnly: opts.cdnOnly,
       });
       const mime = sniffImageMime(bytes) || 'image/jpeg';
       const path = await saveMedia({
@@ -363,6 +376,7 @@ async function fetchItem(
         fullUrl: ref.full_url,
         aesKeyBase64: ref.aes_key,
         maxBytes: opts.maxBytes,
+        cdnOnly: opts.cdnOnly,
       });
       const name = String(file?.file_name ?? '');
       const mime = mimeForInbound(bytes, name);
@@ -382,6 +396,7 @@ async function fetchItem(
         fullUrl: ref.full_url,
         aesKeyBase64: ref.aes_key,
         maxBytes: opts.maxBytes,
+        cdnOnly: opts.cdnOnly,
       });
       const mime = mimeForInbound(bytes, '', 'video/mp4');
       const path = await saveMedia({
@@ -399,6 +414,7 @@ async function fetchItem(
       fullUrl: ref.full_url,
       aesKeyBase64: ref.aes_key,
       maxBytes: opts.maxBytes,
+      cdnOnly: opts.cdnOnly,
     });
     const mime = mimeForInbound(bytes, '', voiceMime(voice?.encode_type));
     const dir = join(opts.inboxDir, 'voices');

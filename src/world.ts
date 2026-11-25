@@ -19,8 +19,10 @@
  * 也拿不到那些字节。
  */
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { basename, extname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import QRCode from 'qrcode';
 
@@ -28,7 +30,9 @@ import pkg from '../package.json' with { type: 'json' };
 
 import type {
   BlobInput,
+  EventEnvelope,
   Logger,
+  RunPhase,
   ToolCallContext,
   ToolDef,
   World,
@@ -38,14 +42,14 @@ import type {
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 
-import { ILinkApi, ILinkError, MAX_TEXT_CHARS, DEFAULT_BASE_URL, DEFAULT_CDN_BASE_URL, errorText } from './protocol/api.ts';
+import { ILinkApi, ILinkError, MAX_TEXT_CHARS, DEFAULT_BASE_URL, DEFAULT_CDN_BASE_URL, errorText, isAbort } from './protocol/api.ts';
 import { MediaTransfer } from './protocol/media.ts';
 import { closeNetworkRoute, createNetworkRoute, type NetworkRoute } from './protocol/network.ts';
-import { fileMessage, imageMessage, textMessage, videoMessage, voiceMessage } from './protocol/outbound.ts';
+import { fileMessage, imageMessage, progressMessage, textMessage, videoMessage, voiceMessage } from './protocol/outbound.ts';
 import { mimeForInbound, mimeFromFilename } from './protocol/mime.ts';
-import { clockText, messageTimeMs, renderInbound, shortId } from './protocol/inbound.ts';
-import { inboundMessageShape, inboundWireType } from './protocol/inbound-shape.ts';
-import { MessageType, UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/types.ts';
+import { clockText, messageTimeMs, renderInbound, renderQuotedMedia, sanitizeRaw, shortId, type InboundMedia, type RenderOptions } from './protocol/inbound.ts';
+import { inboundItemShape, inboundMessageShape, inboundWireType } from './protocol/inbound-shape.ts';
+import { MessageItemType, MessageType, UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/types.ts';
 import { ILinkDriver } from './driver.ts';
 import { CredentialStore, MAX_REPLIES_PER_CONTEXT, type AuthRecord, type ReplyContext } from './store.ts';
 import { pickChannel, splitText } from './text.ts';
@@ -53,6 +57,7 @@ import { fitImage, overCountNote, probeImage, type ImageLimits } from './media/i
 import { MAX_FRAMES } from './media/layout.ts';
 import { segmentDelayMs, splitSegments } from './segment.ts';
 import { prepareOutboundText } from './outbound-text.ts';
+import { QuoteIndex, echoedMediaKind, partialQuote, quoteIds, quoteText, referenceIds, restoreArchivedQuote, type QuoteMedia } from './quotes.ts';
 import { ensureFfmpeg, installFfmpeg, installedSize, removeFfmpeg, type FfmpegResolution, type InstallProgress } from './media/ffmpeg.ts';
 import { extractFrameStrip } from './media/frames.ts';
 import { audioToMp3, audioToSilk } from './media/outbound-voice.ts';
@@ -95,6 +100,27 @@ interface ReplyTarget {
   context: ReplyContext;
 }
 
+type Incoming = { message: WeixinMessage; receivedAtMs: number; confirmedOwner: boolean };
+type PictureBatch = { driver: ILinkDriver; from: string; entries: Incoming[]; deadline: number; timer?: ReturnType<typeof setTimeout> };
+type WechatRun = { auth: AuthRecord; token: string; id: string; timer?: ReturnType<typeof setTimeout>;
+  opened?: Promise<boolean>; closing?: boolean; sentStart?: boolean;
+  endTyping?: () => void; typingDeadline?: ReturnType<typeof setTimeout>; pendingReplies: number; replyFinished?: boolean };
+
+const MAX_WAITING_PICTURES = 8;
+const PROGRESS_DELAY_MS = 2_000;
+const TYPING_REFRESH_MS = 5_000;
+const TYPING_IDLE_LIMIT_MS = 120_000;
+const VERIFY_REQUIRED = 'need_verifycode';
+
+function captionKind(message: WeixinMessage): 'images' | 'text' | 'other' {
+  const items = message.item_list;
+  if (!Array.isArray(items) || !items.length) return 'other';
+  if (items.every(item => inboundWireType(item?.type) === MessageItemType.IMAGE && item.image_item?.media && !item.ref_msg)) return 'images';
+  if (items.every(item => inboundWireType(item?.type) === MessageItemType.TEXT && typeof item.text_item?.text === 'string')
+    && quoteText(message).trim() && !quoteText(message).trimStart().startsWith('/')) return 'text';
+  return 'other';
+}
+
 class ReplySendError extends Error {}
 
 const CONTEXT_EXHAUSTED = '当前入站消息的回复条数配额已用尽，请等对方发来下一条消息后再回复。';
@@ -121,6 +147,7 @@ interface InboundAttachment {
   mime: string;
   bytes: number;
   delivery: 'native' | 'frames' | 'omitted';
+  quoted?: true;
   attachedMimes: string[];
   notes: string[];
 }
@@ -306,6 +333,7 @@ export class WechatClawWorld implements World {
   /** 收件目录；在建实例时解析一次，改配置要重启。 */
   readonly #inboxDir: string;
   readonly #store: CredentialStore;
+  readonly #quotes: QuoteIndex;
   readonly #apiBaseUrl: string = DEFAULT_BASE_URL;
   readonly #cdnBaseUrl: string = DEFAULT_CDN_BASE_URL;
   readonly #readTtsApiKey: (name: string) => string;
@@ -318,6 +346,7 @@ export class WechatClawWorld implements World {
   #api: ILinkApi | null = null;
   #media: MediaTransfer | null = null;
   #driver: ILinkDriver | null = null;
+  #driverChanges = Promise.resolve();
   #auth: AuthRecord | null = null;
 
   #started = false;
@@ -326,7 +355,12 @@ export class WechatClawWorld implements World {
   #lastMessageAt = '';
   #contextCount = 0;
   #outbound = Promise.resolve();
-  /** 段间等待的唤醒钩子；stop() 用它打断睡眠。 */
+  #inboundDispatch = Promise.resolve();
+  #pictureBatch: PictureBatch | null = null;
+  #wechatRunSources = new Map<string, { auth: AuthRecord; token: string }>();
+  #wechatRun: WechatRun | null = null;
+  #runState: RunPhase['state'] | undefined;
+  /** 停止或解绑时，用它提前结束节奏等待。 */
   #sleepWake: (() => void) | null = null;
   #lastInboundTiming: { receivedAt: string; receiveDelayMs: number; queueMs: number; processingMs: number } | null = null;
   #lastInboundAttachments: InboundAttachment[] = [];
@@ -335,7 +369,9 @@ export class WechatClawWorld implements World {
   /** ffmpeg 安装进度；null 表示没在装。 */
   #ffmpegInstall: (InstallProgress & { startedAt: number }) | null = null;
   #ffmpegInstallAbort: AbortController | null = null;
-  #typingTickets = new Map<string, string>();
+  /** 输入状态与正文分开排队，避免旧请求覆盖新一段的提示。 */
+  #typingQueue = Promise.resolve();
+  #typingTicket: { api: ILinkApi; to: string; contextToken: string; value: string } | null = null;
 
   #login: BindingState | null = null;
   #loginLoop: Promise<void> | null = null;
@@ -353,6 +389,7 @@ export class WechatClawWorld implements World {
       configured: opts.cfg.inboxDir,
     });
     this.#store = new CredentialStore(`${opts.dataDir}/${ID}`);
+    this.#quotes = new QuoteIndex(this.#store.dir);
     this.#apiBaseUrl = opts.endpoints?.apiBaseUrl ?? DEFAULT_BASE_URL;
     this.#cdnBaseUrl = opts.endpoints?.cdnBaseUrl ?? DEFAULT_CDN_BASE_URL;
     this.#readTtsApiKey = opts.ttsApiKey ?? (() => '');
@@ -395,11 +432,11 @@ export class WechatClawWorld implements World {
   async #runTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<string> {
     try {
       switch (name) {
-        case 'wechat_send': return await this.#queueSend(ctx, () => this.#toolSendText(args));
-        case 'wechat_send_image': return await this.#queueSend(ctx, () => this.#toolSendMedia(args, 'image'));
-        case 'wechat_send_file': return await this.#queueSend(ctx, () => this.#toolSendMedia(args, 'file'));
-        case 'wechat_send_voice': return await this.#queueSend(ctx, () => this.#toolSendVoice(args, ctx.signal));
-        case 'wechat_speak': return await this.#queueSend(ctx, () => this.#toolSpeak(args, ctx.signal));
+        case 'wechat_send': return await this.#queueReply(ctx, () => this.#toolSendText(args, ctx.signal));
+        case 'wechat_send_image': return await this.#queueReply(ctx, () => this.#toolSendMedia(args, 'image'));
+        case 'wechat_send_file': return await this.#queueReply(ctx, () => this.#toolSendMedia(args, 'file'));
+        case 'wechat_send_voice': return await this.#queueReply(ctx, () => this.#toolSendVoice(args, ctx.signal));
+        case 'wechat_speak': return await this.#queueReply(ctx, () => this.#toolSpeak(args, ctx.signal));
         case 'wechat_status': return this.#toolStatus(args);
         case 'wechat_events': return this.#toolEvents(args);
         default: return `[wechat] 未知工具：${name}`;
@@ -410,8 +447,18 @@ export class WechatClawWorld implements World {
     }
   }
 
+  #queueReply(ctx: ToolCallContext, send: () => Promise<string>): Promise<string> {
+    const scope = this.#wechatRun;
+    if (scope) scope.pendingReplies += 1;
+    return this.#queueSend(ctx, send).finally(() => {
+      if (!scope || --scope.pendingReplies > 0) return;
+      scope.replyFinished = true;
+      this.#stopRunTyping(scope);
+    });
+  }
+
   /** 全部发送工具串行使用回复凭据，容量检查与发件不会被另一调用打断。 */
-  #queueSend(ctx: ToolCallContext, send: () => Promise<string>): Promise<string> {
+  #queueSend<T>(ctx: Pick<ToolCallContext, 'signal'>, send: () => Promise<T>): Promise<T> {
     const auth = this.#auth;
     const outbound = this.#outbound.then(() => {
       ctx.signal?.throwIfAborted();
@@ -467,11 +514,14 @@ export class WechatClawWorld implements World {
     }
   }
 
-  async #sendReply(target: ReplyTarget, message: WeixinMessage, sent: number, total: number) {
+  async #sendReply(target: ReplyTarget, message: WeixinMessage, sent: number, total: number, quoteMedia: QuoteMedia[] = []) {
     try {
       this.#assertReplyActive(target);
-      const response = await this.#requireApi().sendMessage(message);
+      const scope = this.#wechatRun;
+      const runId = scope?.sentStart && scope.auth === target.auth && scope.token === target.context.token ? scope.id : undefined;
+      const response = await this.#requireApi().sendMessage(runId ? { ...message, run_id: runId } : message);
       await this.#recordReply(target, 'sent');
+      await this.#rememberQuote(target.auth, target.to, { ...message, message_id: response?.message_id }, quoteMedia);
       return response;
     } catch (err) {
       let reason = errorText(err);
@@ -490,7 +540,7 @@ export class WechatClawWorld implements World {
    * 逐条真发，条间按配置等待；累计等待到上限就把剩下的连着发完，并在回执里说明。
    * 全部发完才返回——回执报「已发送」时不骗人。
    */
-  async #toolSendText(args: Record<string, unknown>): Promise<string> {
+  async #toolSendText(args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
     const { text, boundaries } = prepareOutboundText(String(args.text ?? '').trim());
     if (!text) throw new Error('text 不能为空。');
     const target = await this.#replyTarget();
@@ -510,10 +560,10 @@ export class WechatClawWorld implements World {
       if (waitMs > 0 && maxTotalMs > 0 && sleptMs + waitMs > maxTotalMs) {
         budgetCut = true;
       } else if (waitMs > 0 && !budgetCut) {
-        void this.#signalTyping(to, contextToken);
-        await this.#sleepMs(waitMs);
+        await this.#waitBeforeReply(target, waitMs, signal);
         sleptMs += waitMs;
       }
+      signal?.throwIfAborted();
       await this.#sendReply(target, textMessage({ to, text: chunks[i]!, contextToken }), i, chunks.length);
     }
 
@@ -569,19 +619,23 @@ export class WechatClawWorld implements World {
     return chunks.length <= remaining ? chunks : splitText(text, MAX_TEXT_CHARS, true, false);
   }
 
-  /** 等一会儿；`stop()` 时会被唤醒，避免关机干等半分钟。 */
-  #sleepMs(ms: number): Promise<void> {
-    if (ms <= 0) return Promise.resolve();
+  /** 只在这段节奏等待里开启提示；提前唤醒也会同时关闭。 */
+  #waitBeforeReply(target: ReplyTarget, ms: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    this.#assertReplyActive(target);
+    // Core 轮次已有统一提示。主动调用发送工具时仍保留分段等待提示。
+    const endTyping = this.#wechatRun?.auth === target.auth ? undefined : this.#startTyping(target.to, target.context.token);
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.#sleepWake = null;
-        resolve();
-      }, ms);
-      this.#sleepWake = () => {
+      const finish = () => {
         clearTimeout(timer);
+        signal?.removeEventListener('abort', finish);
         this.#sleepWake = null;
+        endTyping?.();
         resolve();
       };
+      const timer = setTimeout(finish, ms);
+      this.#sleepWake = finish;
+      signal?.addEventListener('abort', finish, { once: true });
     });
   }
 
@@ -649,7 +703,9 @@ export class WechatClawWorld implements World {
     for (const [i, chunk] of chunks.entries()) {
       await this.#sendReply(target, textMessage({ to, text: chunk, contextToken }), i, total);
     }
-    const response = await this.#sendReply(target, message, chunks.length, total);
+    const response = await this.#sendReply(target, message, chunks.length, total, [{
+      path: filePath, mime, bytes: bytes.length, kind: echoedMediaKind(message), label: basename(filePath), mtimeMs: info.mtimeMs,
+    }]);
 
     this.#host?.log?.info?.('微信已发送媒体', {
       to: shortId(to),
@@ -784,7 +840,7 @@ export class WechatClawWorld implements World {
       loginStatus: login?.status ?? '',
       loginError: login?.error ?? '',
       loginErrorCode: login?.errorCode ?? '',
-      verifyRequired: login?.status === 'need_verifycode',
+      verifyRequired: login?.status.includes(VERIFY_REQUIRED) === true,
     };
   }
 
@@ -1103,6 +1159,10 @@ export class WechatClawWorld implements World {
     // 停掉轮询，避免解绑后还有请求带着旧令牌出去。
     const driver = this.#driver;
     this.#driver = null;
+    this.#discardPictures();
+    this.#wechatRunSources.clear();
+    this.onTurnEnded();
+    this.#sleepWake?.();
     if (driver) {
       try {
         await driver.stop();
@@ -1119,12 +1179,14 @@ export class WechatClawWorld implements World {
     this.#login = null;
     this.#loginAbort = null;
 
+    await this.#typingQueue;
+    await this.#inboundDispatch;
+    this.#typingTicket = null;
     this.#auth = null;
     this.#contextCount = 0;
     this.#lastMessageAt = '';
     this.#lastInboundTiming = null;
     this.#lastInboundAttachments = [];
-    this.#typingTickets.clear();
     this.#lastError = '';
 
     await this.#store.clearSession().catch((err) => {
@@ -1197,6 +1259,7 @@ export class WechatClawWorld implements World {
     login.qrcode = qr.qrcode;
     login.qrUrl = qr.qrUrl;
     login.qrDataUrl = qrDataUrl;
+    login.baseUrl = this.#apiBaseUrl;
     login.status = 'wait';
     login.error = '';
     login.errorCode = '';
@@ -1209,7 +1272,7 @@ export class WechatClawWorld implements World {
     const api = this.#requireApi();
     while (login?.active) {
       // 需要验证码时停下，等操作者在面板里填。
-      if (login.status === 'need_verifycode' && !login.verifyCode) {
+      if (login.status.includes(VERIFY_REQUIRED) && !login.verifyCode) {
         await new Promise((resolve) => setTimeout(resolve, 1_000));
         continue;
       }
@@ -1239,11 +1302,15 @@ export class WechatClawWorld implements World {
 
       const status = String(response?.status ?? 'wait');
       login.status = status;
+      if (status.includes(VERIFY_REQUIRED)) {
+        if (login.verifyCode) login.error = '验证码未通过，请重新输入手机微信上的数字。';
+        login.verifyCode = '';
+        continue;
+      }
 
       switch (status) {
         case 'wait':
         case 'scaned':
-        case 'need_verifycode':
           if (status === 'scaned') login.verifyCode = '';
           break;
         case 'scaned_but_redirect': {
@@ -1251,10 +1318,12 @@ export class WechatClawWorld implements World {
           if (host) login.baseUrl = `https://${host}`;
           break;
         }
-        case 'expired': {
+        case 'expired':
+        case 'verify_code_blocked': {
+          login.verifyCode = '';
           login.refreshCount += 1;
           if (login.refreshCount > 3) {
-            this.#failBinding('expired', '二维码多次失效，请重新生成。');
+            this.#failBinding(status === 'expired' ? 'expired' : 'verify_blocked', '二维码多次失效或验证码锁定，请重新开始绑定。');
             return;
           }
           try {
@@ -1265,9 +1334,6 @@ export class WechatClawWorld implements World {
           }
           break;
         }
-        case 'verify_code_blocked':
-          this.#failBinding('verify_blocked', '验证码错误次数过多，请稍后再试。');
-          return;
         case 'binded_redirect':
           if (response?.bot_token && response?.ilink_bot_id) {
             await this.#finishBinding(response);
@@ -1348,7 +1414,7 @@ export class WechatClawWorld implements World {
   }
 
   #submitVerify(code: unknown): unknown {
-    if (!this.#login?.active) throw new Error('当前没有进行中的扫码。');
+    if (!this.#login?.active || !this.#login.status.includes(VERIFY_REQUIRED)) throw new Error('当前扫码没有要求输入验证码。');
     const value = String(code ?? '').trim();
     if (!/^\d{1,8}$/.test(value)) throw new Error('请填手机微信上显示的数字验证码。');
     this.#login.verifyCode = value;
@@ -1533,6 +1599,7 @@ export class WechatClawWorld implements World {
 
   /** 按当前路由与凭据重建 API 与媒体通道。 */
   async #rebuildClient(): Promise<void> {
+    if (this.#wechatRun) this.#stopRunTyping(this.#wechatRun);
     const route = this.#route ?? createNetworkRoute({ mode: 'inherit' });
     const token = this.#auth?.token ?? '';
     this.#api = new ILinkApi({
@@ -1557,22 +1624,31 @@ export class WechatClawWorld implements World {
    *
    * 旧驱动必须先**真正停下**再起新的：两个驱动会各带自己的游标去问，服务端把消息推给其中
    * 一个、另一个把它写回旧游标，于是两边都以为「没新消息」。连续点几次重连正好触发这个。
-   * 所以这里先置空（让旧驱动的回调立刻失效），再 await 它退出。
+   * 停止旧轮询，再放行已经接收但仍在等说明的图片；最后才启动新驱动。
    */
-  async #startDriver(): Promise<void> {
+  #startDriver(): Promise<void> {
+    const starting = this.#driverChanges.then(() => this.#replaceDriver());
+    this.#driverChanges = starting.catch(() => {});
+    return starting;
+  }
+
+  async #replaceDriver(): Promise<void> {
     const api = this.#api;
     const auth = this.#auth;
     if (!api || !auth?.token) return;
 
     const previous = this.#driver;
-    this.#driver = null;
     if (previous) {
       try {
         await previous.stop();
       } catch (err) {
         this.#host?.log?.warn?.('旧驱动停止失败', { error: errorText(err) });
       }
+      if (previous !== this.#driver) return;
+      await this.#releasePictures();
+      if (previous !== this.#driver) return;
     }
+    if (!this.#started || auth !== this.#auth) return;
 
     // 回调要认「这条消息是不是当前驱动发来的」，所以先声明再赋值。
     let driver: ILinkDriver;
@@ -1630,6 +1706,9 @@ export class WechatClawWorld implements World {
     if (driver !== this.#driver) return;
     this.#lastError = '微信会话已过期，请重新扫码绑定。';
     this.#driver = null;
+    this.#discardPictures();
+    this.#wechatRunSources.clear();
+    this.onTurnEnded();
     this.#auth = null;
     this.#contextCount = 0;
     void driver.stop();
@@ -1681,10 +1760,213 @@ export class WechatClawWorld implements World {
     this.#host?.log?.warn?.('未识别的微信入站结构', { reason, ...shape });
   }
 
+  async #maybeReplyToCommand(auth: AuthRecord, from: string, msg: WeixinMessage, token: string, received: number, processing: number): Promise<boolean> {
+    const items = msg.item_list;
+    if (items?.length !== 1 || inboundWireType(items[0]?.type) !== MessageItemType.TEXT || items[0].ref_msg) return false;
+    const text = quoteText(msg).trim();
+    const command = text.match(/^\/(状态|status|echo)(?:\s+([\s\S]*))?$/i);
+    if (!command || (command[1].toLowerCase() !== 'echo' && command[2])) return false;
+    const echo = command[1].toLowerCase() === 'echo';
+    const timing = `微信 → 扩展 ${Math.max(0, received - messageTimeMs(msg))} ms，排队 ${Math.max(0, processing - received)} ms`;
+    try {
+      await this.#queueSend({}, async () => {
+        if (auth !== this.#auth || !token) return;
+        const target = await this.#replyTarget();
+        if (target.to !== from || target.context.token !== token) return;
+        const state = this.#runState && { idle: '空闲', delivering: '投递消息', model: '等待模型', tools: '执行工具', backoff: '等待重试', handoff: '交接上下文' }[this.#runState];
+        const prefix = echo ? (command[2]?.trim().slice(0, 1000) || '微信通道正常')
+          : `微信通道正常（未调用模型）${state ? `\n桌宠：${state}` : ''}`;
+        const line = `${prefix}\n${timing}，本地处理 ${Date.now() - processing} ms`;
+        await this.#sendReply(target, textMessage({ to: from, text: line, contextToken: token }), 0, 1);
+      });
+    } catch {
+      this.#host?.log?.warn?.('微信未能回复通道诊断指令');
+    }
+    await this.#pushEvent({ type: EVENT_MESSAGE, source: ID, origin: 'external', senderKey: from,
+      ts: new Date(messageTimeMs(msg)).toISOString(), text: echo ? '/echo' : '/status', meta: { kind: 'message/diagnostic' } }, { deliver: false });
+    return true;
+  }
+
+  async #rememberQuote(auth: AuthRecord, peer: string, message: WeixinMessage, media: QuoteMedia[]): Promise<void> {
+    await this.#quotes.remember(auth.accountId, peer, quoteIds(message), quoteText(message), media).catch(() => {
+      this.#host?.log?.warn?.('微信引用索引未保存，消息收发不受影响');
+    });
+  }
+
+  async #resolveQuote(auth: AuthRecord, peer: string, message: WeixinMessage, summary: string, opts: RenderOptions) {
+    const ref = Array.isArray(message.item_list) ? message.item_list.find(item => item?.ref_msg)?.ref_msg : undefined;
+    if (!ref) return { text: summary, media: [] as InboundMedia[] };
+
+    const ids = referenceIds(ref);
+    const host = this.#host;
+    const acceptsKind = { image: opts.downloadImages, file: opts.downloadFiles, video: opts.downloadVideo, voice: opts.downloadVoice };
+    const accepts = (kind: InboundMedia['kind'], bytes: number) => acceptsKind[kind] && bytes <= opts.maxBytes;
+    const notes: string[] = [];
+    let original = '';
+    let media: InboundMedia[] = [];
+    try {
+      let saved: Awaited<ReturnType<QuoteIndex['find']>>;
+      for (const id of ids) {
+        saved = await this.#quotes.find(auth.accountId, peer, id, this.#sendRoots());
+        if (saved) break;
+      }
+      if (saved) {
+        original = saved.text;
+        media = saved.media.filter(item => accepts(item.kind, item.bytes));
+        if (saved.missing) notes.push(`[${saved.missing} 个引用附件已删除或变更]`);
+        if (saved.media.length > media.length) notes.push('[部分引用附件未附：接收设置关闭或超过体积限制]');
+      } else if (host && ids.length) {
+        const recent = host.store.range({ source: ID, senderKey: peer, limit: 500 }).slice().reverse();
+        for (const id of ids) {
+          const archived = recent.find(event => {
+            const raw = event.meta?.raw as WeixinMessage | undefined;
+            return event.type === EVENT_MESSAGE && event.senderKey === peer && event.source === ID && raw
+              && (event.meta?.bindingAccount ?? raw.to_user_id) === auth.accountId
+              && !event.meta?.imageCaptionBatch && quoteIds(raw).includes(id);
+          });
+          if (!archived) continue;
+          const raw = archived.meta!.raw as WeixinMessage;
+          original = quoteText(raw);
+          const restored = await restoreArchivedQuote(archived, host, this.#inboxDir, accepts);
+          media = restored.media;
+          if (restored.unavailable) notes.push('[引用附件在 Core 归档中已不可用]');
+          if (restored.excluded) notes.push('[部分引用附件未附：接收设置关闭或超过体积限制]');
+          if (media.length && !notes.length) await this.#rememberQuote(auth, peer, raw, media);
+          break;
+        }
+      }
+    } catch {
+      this.#logInboundShape('quote-lookup-failed', { hasServerId: ids.length > 0 });
+    }
+
+    const rawText = ref.message_item?.text_item?.text;
+    const inlineText = typeof rawText === 'string' ? rawText.trim() : '';
+    let text = original ? partialQuote(original, ref.partial_text) : inlineText || summary;
+    if (!media.length) {
+      const inline = await renderQuotedMedia(ref.message_item, opts);
+      if (inline?.media.length) {
+        text = [text, inline.text].filter(Boolean).join(' ');
+        return { text, media: inline.media.map(item => ({ ...item, label: `[引用附件 ${basename(item.path)}]` })) };
+      }
+      if (inline?.text) notes.push(`引用附件：${inline.text}`);
+      if (!notes.length && !original && !inlineText && ids.length) notes.push('[未找到被引用的消息或附件]');
+      if (notes.length || (!original && text === '[引用消息]')) {
+        this.#logInboundShape('quote-unavailable', { hasServerId: ids.length > 0, ...inboundItemShape(ref.message_item) });
+      }
+    }
+    if (media.length && /^\[引用消息(?: #[0-9]+)?\]$/.test(text)) text = media.map(item => item.label).join(' ');
+    return { text: [text, ...notes].filter(Boolean).join(' '), media };
+  }
+
+  #rememberWechatRunSource(auth: AuthRecord, token: string): string | undefined {
+    if (!token || !this.#started) return;
+    const key = randomUUID();
+    this.#wechatRunSources.set(key, { auth, token });
+    if (this.#wechatRunSources.size > 64) this.#wechatRunSources.delete(this.#wechatRunSources.keys().next().value!);
+    return key;
+  }
+
+  onEventsSettled(events: readonly EventEnvelope[], outcome: 'delivered' | 'discarded'): void {
+    let source: { auth: AuthRecord; token: string } | undefined;
+    for (const event of events) {
+      const key = event.meta?.wechatRunKey;
+      if (event.source !== ID || typeof key !== 'string') continue;
+      const candidate = this.#wechatRunSources.get(key);
+      this.#wechatRunSources.delete(key);
+      if (candidate?.auth === this.#auth && event.senderKey === this.#auth?.userId) source = candidate;
+    }
+    if (this.#started && source && outcome === 'delivered') {
+      this.onTurnEnded();
+      this.#wechatRun = { ...source, id: randomUUID(), pendingReplies: 0 };
+    }
+  }
+
+  onRunPhase(phase: RunPhase): void {
+    this.#runState = phase.state;
+    const scope = this.#wechatRun;
+    if (!scope) return;
+    if (phase.state === 'idle' || phase.state === 'handoff' || phase.state === 'delivering') {
+      this.onTurnEnded();
+      return;
+    }
+    if (!scope.replyFinished) this.#touchRunTyping(scope);
+    const working = this.#cfg.nativeProgressEnabled === true && phase.state === 'tools' && phase.running.some(name => !name.startsWith('wechat_'));
+    if (!working) {
+      clearTimeout(scope.timer);
+      scope.timer = undefined;
+      this.#closeProgressCard(scope);
+      return;
+    }
+    if (scope.timer || scope.opened) return;
+    scope.timer = setTimeout(() => {
+      scope.timer = undefined;
+      if (this.#wechatRun === scope) scope.opened = this.#sendProgress(scope, 'start');
+    }, PROGRESS_DELAY_MS);
+    scope.timer.unref?.();
+  }
+
+  #touchRunTyping(scope: WechatRun): void {
+    if (!this.#started || !this.#driver || scope.auth !== this.#auth) return;
+    scope.endTyping ??= this.#startTyping(scope.auth.userId, scope.token, true);
+    clearTimeout(scope.typingDeadline);
+    scope.typingDeadline = setTimeout(() => this.#stopRunTyping(scope), TYPING_IDLE_LIMIT_MS);
+    scope.typingDeadline.unref?.();
+  }
+
+  #stopRunTyping(scope: WechatRun): void {
+    clearTimeout(scope.typingDeadline);
+    scope.typingDeadline = undefined;
+    scope.endTyping?.();
+    scope.endTyping = undefined;
+  }
+
+  onTurnEnded(): void {
+    const scope = this.#wechatRun;
+    this.#wechatRun = null;
+    if (scope) {
+      this.#stopRunTyping(scope);
+      this.#closeProgressCard(scope);
+    }
+  }
+
+  #closeProgressCard(scope: WechatRun): void {
+    clearTimeout(scope.timer);
+    scope.timer = undefined;
+    if (!scope.opened || scope.closing) return;
+    scope.closing = true;
+    void scope.opened.then(started => { if (started) return this.#sendProgress(scope, 'end'); });
+  }
+
+  #sendProgress(scope: WechatRun, phase: 'start' | 'end'): Promise<boolean> {
+    return this.#queueSend({}, async () => {
+      if (!this.#started || !this.#driver || scope.auth !== this.#auth ||
+        (phase === 'start' && (this.#wechatRun !== scope || scope.closing || this.#cfg.nativeProgressEnabled !== true))) return false;
+      const to = scope.auth.userId;
+      const context = await this.#store.getReplyContext(to);
+      if (!context || context.rejected || context.token !== scope.token) return false;
+      // A start plus its result must leave eight slots for the user's actual reply.
+      const minimum = phase === 'start' ? MAX_SEGMENT_THRESHOLD + 2 : 2;
+      if (MAX_REPLIES_PER_CONTEXT - context.sent < minimum) return false;
+      if (phase === 'start' && (this.#wechatRun !== scope || scope.closing)) return false;
+      const target = { to, auth: scope.auth, context };
+      this.#assertReplyActive(target);
+      const response = await this.#requireApi().sendMessage(progressMessage({ to, contextToken: scope.token, runId: scope.id, phase }));
+      if (response?.ret !== 0 && !response?.message_id) throw new Error('进度卡响应为空');
+      // A progress-only rejection must not invalidate the token needed for the actual reply.
+      await this.#recordReply(target, 'sent');
+      if (phase === 'start') scope.sentStart = true;
+      return true;
+    }).catch(() => {
+      this.#host?.log?.warn?.('微信任务进度卡未发送，正文不受影响', { phase });
+      return false;
+    });
+  }
+
   async #handleInbound(driver: ILinkDriver, message: WeixinMessage, receivedAtMs: number): Promise<void> {
-    if (driver !== this.#driver) return;
+    if (driver !== this.#driver || !this.#started) return;
     // 自己发出去的消息不回到自己这里。
     const from = typeof message?.from_user_id === 'string' ? message.from_user_id.trim() : '';
+    if (message?.group_id) return;
     const type = inboundWireType(message?.message_type);
     if (type === MessageType.BOT) {
       if (from && from === this.#auth?.userId) this.#logInboundShape('unexpected-bot-message-from-owner', inboundMessageShape(message));
@@ -1699,17 +1981,69 @@ export class WechatClawWorld implements World {
     // 只接受绑定本人发来的消息。别的人（群成员、服务通知、陌生人）一律丢弃：
     // 收件人已经钉死在 auth.userId，这里再放行，非本人的内容就会进入上下文，
     // 并且「回复」的语义会被引到错误的人身上。
+    const confirmedOwner = from === this.#auth?.userId;
     if (!this.#acceptSender(from)) return;
     if (type !== MessageType.USER && type !== MessageType.NONE) {
       this.#logInboundShape('unexpected-message-type', inboundMessageShape(message));
     }
 
+    const entry = { message, receivedAtMs, confirmedOwner };
+    const windowMs = this.#cfg.receiveImages === false ? 0 : Math.min(5, Math.max(0, Number(this.#cfg.imageCaptionWindowSec) || 0)) * 1000;
+    const kind = windowMs ? captionKind(message) : 'other';
+    const pending = this.#pictureBatch;
+    if (pending && (pending.driver !== driver || pending.from !== from || receivedAtMs > pending.deadline || kind === 'other')) {
+      void this.#releasePictures();
+    }
+    if (kind === 'images') {
+      const batch = this.#pictureBatch ?? { driver, from, entries: [], deadline: receivedAtMs + windowMs };
+      if (!this.#pictureBatch) {
+        this.#pictureBatch = batch;
+        batch.timer = setTimeout(() => { if (this.#pictureBatch === batch) void this.#releasePictures(); },
+          Math.max(0, batch.deadline - Date.now()));
+        batch.timer.unref?.();
+      }
+      batch.entries.push(entry);
+      if (batch.entries.length >= MAX_WAITING_PICTURES) await this.#releasePictures();
+      return;
+    }
+    if (kind === 'text' && this.#pictureBatch) {
+      this.#pictureBatch.entries.push(entry);
+      await this.#releasePictures();
+      return;
+    }
+    await this.#dispatchInbound(driver, from, [entry]);
+  }
+
+  #releasePictures(): Promise<void> {
+    const batch = this.#pictureBatch;
+    if (!batch) return this.#inboundDispatch;
+    clearTimeout(batch.timer);
+    this.#pictureBatch = null;
+    return this.#dispatchInbound(batch.driver, batch.from, batch.entries);
+  }
+
+  #discardPictures(): void {
+    clearTimeout(this.#pictureBatch?.timer);
+    this.#pictureBatch = null;
+  }
+
+  #dispatchInbound(driver: ILinkDriver, from: string, entries: Incoming[]): Promise<void> {
+    const delivery = this.#inboundDispatch.then(() => this.#deliverInbound(driver, from, entries));
+    this.#inboundDispatch = delivery.catch(err => this.#host?.log?.warn?.('微信入站消息处理失败', { error: errorText(err) }));
+    return this.#inboundDispatch;
+  }
+
+  async #deliverInbound(driver: ILinkDriver, from: string, entries: Incoming[]): Promise<void> {
+    if (driver !== this.#driver || !this.#auth || !entries.length) return;
+    const auth = this.#auth;
+    const { message, receivedAtMs } = entries[entries.length - 1];
+
     const processingAtMs = Date.now();
-    const atMs = messageTimeMs(message);
+    const atMs = Math.max(...entries.map(entry => messageTimeMs(entry.message)));
     const messageAt = new Date(atMs).toISOString();
     if (!this.#lastMessageAt || atMs > Date.parse(this.#lastMessageAt)) this.#lastMessageAt = messageAt;
 
-    const contextToken = String(message?.context_token ?? '').trim();
+    const contextToken = entries.map(entry => String(entry.message?.context_token ?? '').trim()).filter(Boolean).at(-1) ?? '';
     if (contextToken) {
       try {
         await this.#store.saveContextToken(from, contextToken);
@@ -1725,8 +2059,11 @@ export class WechatClawWorld implements World {
       this.#host?.log?.warn?.('最近消息时间未保存', { error: errorText(err) });
     }
 
+    if (entries.length === 1 && entries[0].confirmedOwner &&
+      await this.#maybeReplyToCommand(auth, from, message, contextToken, receivedAtMs, processingAtMs)) return;
+
     const maxBytes = this.#mediaByteLimit();
-    const rendered = await renderInbound(message, {
+    const renderOptions: Parameters<typeof renderInbound>[1] = {
       media: this.#media,
       inboxDir: this.#inboxDir,
       downloadImages: this.#cfg.receiveImages !== false,
@@ -1735,7 +2072,24 @@ export class WechatClawWorld implements World {
       downloadVideo: this.#cfg.receiveVideos === true,
       maxBytes,
       onUnexpected: (reason, shape) => this.#logInboundShape(reason, shape),
-    });
+    };
+    const parts: Awaited<ReturnType<typeof renderInbound>>[] = [];
+    for (const entry of entries) {
+      if (driver !== this.#driver || auth !== this.#auth) return;
+      const part = await renderInbound(entry.message, renderOptions);
+      parts.push(part);
+      await this.#rememberQuote(auth, from, entry.message, part.media);
+    }
+    const last = parts[parts.length - 1];
+    const rendered = parts.length === 1 ? last : {
+      text: parts.map(part => part.text).filter(Boolean).join('\n'),
+      media: parts.flatMap(part => part.media), transcript: last.transcript, quote: last.quote,
+      raw: sanitizeRaw({ ...message, item_list: parts.flatMap(part => part.raw.item_list ?? []) }),
+    };
+    const quoted = await this.#resolveQuote(auth, from, message, last.quote, renderOptions);
+    rendered.quote = quoted.text;
+    const ownMediaCount = rendered.media.length;
+    rendered.media = [...rendered.media, ...quoted.media];
 
     const blobs: AttachmentBlob[] = [];
     const host = this.#host;
@@ -1747,7 +2101,7 @@ export class WechatClawWorld implements World {
     const limits = this.#imageLimits();
 
     for (const item of rendered.media) {
-      if (driver !== this.#driver || !this.#started) return;
+      if (driver !== this.#driver || auth !== this.#auth) return;
       const before = blobs.length;
       const noteIndex = fitNotes.length;
       try {
@@ -1776,15 +2130,21 @@ export class WechatClawWorld implements World {
         } else {
           fitNotes.push(`${item.label} 未附：当前 Provider 不接受 ${item.mime} 输入。`);
         }
+      } catch {
+        fitNotes.push(`${item.label} 未附：处理附件时出错。`);
       } finally {
         const attachedMimes = blobs.slice(before).map((blob) => blob.mime);
+        const quoted = attachments.length >= ownMediaCount;
+        if (quoted && !attachedMimes.length) fitNotes.push(`[引用附件已存为 ${item.path}]`);
+        const frames = (item.videoFrames || item.mime.startsWith('video/')) && attachedMimes[0]?.startsWith('image/');
         attachments.push({ kind: item.kind, name: basename(item.path), mime: item.mime, bytes: item.bytes,
-          delivery: attachedMimes.length ? (item.mime.startsWith('video/') && attachedMimes[0].startsWith('image/') ? 'frames' : 'native') : 'omitted',
+          ...(quoted ? { quoted: true } : {}),
+          delivery: attachedMimes.length ? (frames ? 'frames' : 'native') : 'omitted',
           attachedMimes, notes: fitNotes.slice(noteIndex) });
       }
     }
 
-    if (driver !== this.#driver || !this.#started) return;
+    if (driver !== this.#driver || auth !== this.#auth) return;
     this.#lastInboundAttachments = attachments;
     this.#lastInboundTiming = {
       receivedAt: new Date(receivedAtMs).toISOString(),
@@ -1798,6 +2158,7 @@ export class WechatClawWorld implements World {
     const quoteLine = rendered.quote ? `（回复 ${rendered.quote}）` : '';
     const base = rendered.text || '[空消息]';
     const body = fitNotes.length ? `${base}\n${fitNotes.join('\n')}` : base;
+    const wechatRunKey = entries.every(entry => entry.confirmedOwner) ? this.#rememberWechatRunSource(auth, contextToken) : undefined;
     await this.#pushEvent({
       type: EVENT_MESSAGE,
       ts: messageAt,
@@ -1809,16 +2170,16 @@ export class WechatClawWorld implements World {
       meta: {
         kind: 'message/private',
         conv: { kind: 'private', id: from },
+        bindingAccount: auth.accountId,
         raw: rendered.raw,
         ...(rendered.transcript ? { transcript: rendered.transcript } : {}),
         ...(rendered.quote ? { quote: rendered.quote } : {}),
         media: rendered.media.map((item, i) => ({ ...attachments[i], label: item.label })),
+        ...(entries.length > 1 ? { imageCaptionBatch: entries.length } : {}),
+        ...(wechatRunKey ? { wechatRunKey } : {}),
         timing: this.#lastInboundTiming,
       },
     }, { deliver: true, trigger: resolveInboundTrigger(this.#cfg.inboundTrigger) });
-
-    // 输入状态是锦上添花：拿不到 ticket 就跳过。
-    void this.#signalTyping(from, contextToken);
   }
 
   #mimeSupport(mime: string): { accepted: boolean; error?: string } {
@@ -1971,22 +2332,62 @@ export class WechatClawWorld implements World {
     return `[视频拼图：${sizeNote}${result.note}]`;
   }
 
-  async #signalTyping(userId: string, contextToken: string): Promise<void> {
+  #startTyping(to: string, contextToken: string, renew = false): () => void {
     const api = this.#api;
-    if (!api) return;
-    try {
-      let ticket = this.#typingTickets.get(userId) ?? '';
-      if (!ticket) {
-        const config = await api.getConfig({ ilinkUserId: userId, contextToken });
-        if (Number(config?.ret ?? 0) !== 0) return;
-        ticket = String(config?.typing_ticket ?? '').trim();
-        if (!ticket) return;
-        this.#typingTickets.set(userId, ticket);
+    if (!api) return () => {};
+    const wait = new AbortController();
+    const ended = new Promise<void>((resolve) => wait.signal.addEventListener('abort', () => resolve(), { once: true }));
+    const stillWaiting = () => !wait.signal.aborted && api === this.#api;
+
+    this.#typingQueue = this.#typingQueue.then(async () => {
+      if (!stillWaiting()) return;
+      let cached = this.#typingTicket;
+      if (!cached || cached.api !== api || cached.to !== to || cached.contextToken !== contextToken) {
+        try {
+          const config = await api.getConfig({ ilinkUserId: to, contextToken, signal: wait.signal });
+          const value = String(config?.typing_ticket ?? '').trim();
+          if (!stillWaiting() || !value) return;
+          cached = { api, to, contextToken, value };
+          this.#typingTicket = cached;
+        } catch (err) {
+          if (!wait.signal.aborted) this.#logTypingFailure('ticket', err);
+          return;
+        }
       }
-      await api.sendTyping({ ilink_user_id: userId, typing_ticket: ticket, status: TypingStatus.TYPING });
-    } catch {
-      /* 输入状态失败不影响消息。 */
-    }
+      const request = { ilink_user_id: to, typing_ticket: cached.value };
+      let failures = 0;
+      do {
+        try {
+          await api.sendTyping({ ...request, status: TypingStatus.TYPING });
+          failures = 0;
+        } catch (err) {
+          this.#typingTicket = null;
+          failures += 1;
+          this.#logTypingFailure('start', err);
+        }
+        if (!renew || failures >= 2 || !stillWaiting()) break;
+        await delay(TYPING_REFRESH_MS, undefined, { signal: wait.signal, ref: false }).catch(() => {});
+      } while (stillWaiting());
+      // 开启请求一旦发出，即使超时也可能已被微信处理。等它结束后再用同一张票取消。
+      if (!renew) await ended;
+      try {
+        await api.sendTyping({ ...request, status: TypingStatus.CANCEL });
+      } catch (err) {
+        this.#typingTicket = null;
+        this.#logTypingFailure('cancel', err);
+      }
+    });
+    return () => wait.abort();
+  }
+
+  #logTypingFailure(action: 'ticket' | 'start' | 'cancel', err: unknown): void {
+    // 网关响应正文可能含凭据；这里只记录阶段、超时和数字错误码。
+    this.#host?.log?.warn?.('微信输入状态请求失败（不影响发消息）', {
+      action,
+      timeout: isAbort(err),
+      ret: err instanceof ILinkError && Number.isFinite(err.ret) ? err.ret : undefined,
+      status: err instanceof ILinkError ? err.status : undefined,
+    });
   }
 
   async #pushEvent(
@@ -2000,6 +2401,8 @@ export class WechatClawWorld implements World {
 
   async stop(): Promise<void> {
     this.#started = false;
+    this.#wechatRunSources.clear();
+    this.onTurnEnded();
     // 打断段间等待，否则关机要干等到间隔结束。
     this.#sleepWake?.();
     const login = this.#login;
@@ -2009,6 +2412,9 @@ export class WechatClawWorld implements World {
     this.#loginLoop = null;
     if (loginLoop) await loginLoop.catch(() => {});
 
+    await this.#typingQueue;
+    this.#typingTicket = null;
+    await this.#driverChanges;
     const api = this.#api;
     if (api && this.#auth?.token) {
       await api.notifyStop().catch((err) => {
@@ -2017,8 +2423,10 @@ export class WechatClawWorld implements World {
     }
 
     const driver = this.#driver;
-    this.#driver = null;
     if (driver) await driver.stop();
+    await this.#releasePictures();
+    this.#driver = null;
+    this.#runState = undefined;
 
     const route = this.#route;
     this.#route = null;

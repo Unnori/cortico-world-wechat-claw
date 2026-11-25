@@ -40,6 +40,7 @@ export const MAX_TEXT_CHARS = 4000;
 
 const API_TIMEOUT_MS = 15_000;
 const CONFIG_TIMEOUT_MS = 10_000;
+const TYPING_TIMEOUT_MS = 1_500;
 const LONG_POLL_TIMEOUT_MS = 35_000;
 /** 官方扫码状态轮询的超时。 */
 export const QR_POLL_TIMEOUT_MS = 35_000;
@@ -218,8 +219,10 @@ export class ILinkApi {
     if (this.#dispatcher) init.dispatcher = this.#dispatcher;
 
     let response: Response;
+    let raw: string;
     try {
       response = await this.#fetchImpl(url.toString(), init);
+      raw = await response.text();
     } catch (err) {
       if (isAbort(err)) throw err;
       throw new ILinkError(`${opts.label}：${classifyFetchError(err)}（${where}）`);
@@ -227,7 +230,6 @@ export class ILinkApi {
       clearTimeout(timer);
     }
 
-    const raw = await response.text();
     if (!response.ok) {
       const detail = raw ? `：${raw.slice(0, 200)}` : '';
       throw new ILinkError(`${opts.label}：HTTP ${response.status}${detail}`, {
@@ -354,8 +356,8 @@ export class ILinkApi {
   }
 
   /** 取账号配置（含 typing ticket）。 */
-  async getConfig(params: { ilinkUserId: string; contextToken?: string }): Promise<GetConfigResp> {
-    return this.#request<GetConfigResp>({
+  async getConfig(params: { ilinkUserId: string; contextToken?: string; signal?: AbortSignal }): Promise<GetConfigResp> {
+    const data = await this.#request<GetConfigResp>({
       baseUrl: this.baseUrl,
       token: this.token,
       endpoint: 'ilink/bot/getconfig',
@@ -365,28 +367,34 @@ export class ILinkApi {
         context_token: params.contextToken,
         base_info: this.baseInfo(),
       },
-      timeoutMs: CONFIG_TIMEOUT_MS,
+      timeoutMs: TYPING_TIMEOUT_MS,
+      signal: params.signal,
       authenticated: true,
       fetchImpl: this.#fetchImpl,
       dispatcher: this.#dispatcher,
       label: '读取配置',
     });
+    const ret = Number(data?.ret ?? 0);
+    if (ret !== 0) throw new ILinkError('读取输入状态票据失败', { ret });
+    return data;
   }
 
   /** 输入状态。失败只影响提示，不影响收发。 */
   async sendTyping(req: SendTypingReq): Promise<void> {
-    await this.#request<unknown>({
+    const data = await this.#request<{ ret?: number }>({
       baseUrl: this.baseUrl,
       token: this.token,
       endpoint: 'ilink/bot/sendtyping',
       method: 'POST',
       body: { ...req, base_info: this.baseInfo() },
-      timeoutMs: CONFIG_TIMEOUT_MS,
+      timeoutMs: TYPING_TIMEOUT_MS,
       authenticated: true,
       fetchImpl: this.#fetchImpl,
       dispatcher: this.#dispatcher,
       label: '发送输入状态',
     });
+    const ret = Number(data?.ret ?? 0);
+    if (ret !== 0) throw new ILinkError('发送输入状态失败', { ret });
   }
 
   /** 通知服务端本客户端启动；失败不影响挂载。 */
