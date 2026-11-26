@@ -203,11 +203,11 @@ corepack pnpm add "<本地包目录，绝对路径，例如 E:\WorkShop\...\cort
 
 ## 视频抽帧
 
-入站文件按可确认的文件头识别 PDF、图片、音频和视频容器；无法确认时使用文件名或微信语音编码提供的类型。每次收件都调用宿主的 `modelFacts.accepts(实际 MIME)`，随当前模型、Provider 协议和输入开关变化。支持时通过事件 `blobs` 提交实际字节、MIME 与文件名；未知类型不会冒充支持的格式。
+入站文件按可确认的文件头识别 PDF、图片、音频和视频容器；无法确认时使用文件名或微信语音编码提供的类型。每次收件都调用宿主的 `modelFacts.accepts(实际 MIME)`，随当前模型、Provider 协议和输入开关变化。支持时通过事件 `blobs` 提交实际字节、MIME 与文件名。音频会尝试同格式的 MIME 别名，例如 MP3 的 `audio/mpeg`、`audio/mp3` 和 `audio/mpga`。
 
 可调用 `wechat_status`，传入 `{"mimes":["video/mp4","audio/wav","application/pdf"]}` 查看 `inputSupport`。`accepted` 是当前 Provider 的类型判断，`error` 表示查询失败；`receive` 是本扩展的下载开关。`lastInboundAttachments` 与事件的 `meta.media` 记录每份文件交给 Core 时的结果：`native` 为原样附件，`frames` 为视频拼图，`omitted` 为未附，原因在 `notes`。这不代表上游已经成功理解文件；字节、总请求大小等仍由 Provider 和上游校验。
 
-OpenCode 原生 Gemini 会将支持的音频、视频、PDF 等附件编码到请求的 `contents[].parts[].inlineData`。请先在 OpenCode 获取模型列表以更新格式声明，并确认所需输入类型未关闭。微信视频消息还需在本扩展打开「收视频」，文件通道发送的视频由「收文件」控制。微信 SILK 转码成功后使用 `audio/wav` 判断附件支持，服务端转写仍会投递。
+OpenCode 原生 Gemini 会将支持的音频、视频、PDF 等附件编码到请求的 `contents[].parts[].inlineData`。请先在 OpenCode 获取模型列表以更新格式声明，并确认所需输入类型未关闭。微信视频消息还需在本扩展打开「收视频」，文件通道发送的视频由「收文件」控制。标准 MP3 等音频按原字节投递。微信下发的 `#!OPUS_RAW_V1` 语音先无损封装为 Ogg Opus，SILK v3 转为 WAV。遇到未知编码或特征数据时保留文件和转写，并说明未附原因。
 
 OpenCode Provider 必须包含 Gemini 工具回执附件保留修复：Core 将外部事件投递为工具回执，旧版转换只发送回执文字，即使 World 已提供 `blobs`，生成请求时仍会丢失媒体。仅更新本扩展不能修复 Provider 内部的这一步。
 

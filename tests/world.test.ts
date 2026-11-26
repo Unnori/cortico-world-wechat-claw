@@ -1717,6 +1717,7 @@ describe('原生媒体投递', () => {
     accept?: boolean;
     imageMaxEdge?: number;
     bytes?: Buffer;
+    encodeType?: number;
     cfg?: Partial<WechatClawConfigSection>;
     configureHost?: (host: FakeHost) => void;
   }) {
@@ -1747,7 +1748,7 @@ describe('原生媒体投递', () => {
     await world.start(host);
     const media = { encrypt_query_param: 'download-param-native', aes_key: key.toString('base64') };
     const item = opts.kind === 'voice'
-      ? { type: 3, voice_item: { media, encode_type: 7, text: '微信给出的转写', playtime: 1000 } }
+      ? { type: 3, voice_item: { media, encode_type: opts.encodeType, text: '微信给出的转写', playtime: 1000 } }
       : opts.kind === 'video' ? { type: 5, video_item: { media } }
         : opts.kind === 'image' ? { type: 2, image_item: { media } }
           : { type: 4, file_item: { media, file_name: opts.filename, len: String(bytes.length) } };
@@ -1899,12 +1900,76 @@ describe('原生媒体投递', () => {
     } finally { await world.stop(); }
   });
 
-  it('语音使用真实编码附上，保留服务端转写', async () => {
-    const { world, event, blobs } = await receiveMedia({ mime: 'audio/mpeg', kind: 'voice' });
+  it.each([
+    [7, 'audio/mpeg'], [4, 'audio/mp3'], [7, 'audio/mpga'], [undefined, 'audio/mpeg'],
+  ] as const)('MP3 语音的微信编码为 %s 时能按 Provider 声明的 %s 原样投递', async (encodeType, mime) => {
+    const mp3 = Buffer.from('fffb9064' + '00'.repeat(413), 'hex');
+    const { world, event, blobs } = await receiveMedia({ mime, kind: 'voice', bytes: mp3, encodeType });
     try {
-      expect(blobs[0].mime).toBe('audio/mpeg');
-      expect(blobs[0].name).toMatch(/\.mp3$/);
+      expect(blobs).toEqual([expect.objectContaining({ mime, name: expect.stringMatching(/\.mp3$/), bytes: new Uint8Array(mp3) })]);
+      expect(event.meta?.media).toEqual([expect.objectContaining({ mime: 'audio/mpeg', delivery: 'native', attachedMimes: [mime] })]);
       expect(event.text).toContain('微信给出的转写');
+    } finally { await world.stop(); }
+  });
+
+  it.each(['audio/opus', 'audio/ogg'])('把标成 MP3 的微信原始 Opus 封装后按 %s 投递', async mime => {
+    const packet = Buffer.from('0300f8fffe', 'hex');
+    const raw = Buffer.concat([Buffer.from('#!OPUS_RAW_V1\x02\x01\0'), ...Array<Buffer>(55).fill(packet)]);
+    const { world, event, blobs } = await receiveMedia({ mime, kind: 'voice', bytes: raw, encodeType: 7 });
+    try {
+      expect(blobs).toEqual([expect.objectContaining({ mime, name: expect.stringMatching(/\.opus$/) })]);
+      const ogg = Buffer.from(blobs[0].bytes);
+      const pages: Array<{ flags: number; granule: bigint; payload: Buffer }> = [];
+      for (let start = 0; start < ogg.length;) {
+        expect(ogg.toString('ascii', start, start + 4)).toBe('OggS');
+        const payloadOffset = start + 27 + ogg[start + 26];
+        const size = ogg.subarray(start + 27, payloadOffset).reduce((sum, byte) => sum + byte, 0);
+        pages.push({ flags: ogg[start + 5], granule: ogg.readBigUInt64LE(start + 6), payload: ogg.subarray(payloadOffset, payloadOffset + size) });
+        start = payloadOffset + size;
+      }
+      expect(pages.map(p => [p.flags, p.granule])).toEqual([[2, 0n], [0, 0n], [0, 48000n], [4, 52800n]]);
+      expect(pages[0].payload.subarray(0, 8).toString()).toBe('OpusHead');
+      expect(pages[0].payload.readUInt32LE(12)).toBe(16000);
+      expect(Buffer.concat(pages.slice(2).map(p => p.payload))).toEqual(Buffer.concat(Array<Buffer>(55).fill(packet.subarray(2))));
+      expect(event.text).toContain('已封装为 Ogg Opus');
+      expect(event.text).toContain('微信给出的转写');
+    } finally { await world.stop(); }
+  });
+
+  it('损坏的微信 Opus 保留原文件与转写，禁止当 MP3 投递', async () => {
+    const raw = Buffer.from('#!OPUS_RAW_V1\x02\x01\0\x10\x00\xf8', 'latin1');
+    const { world, event, blobs } = await receiveMedia({ mime: 'audio/mpeg', kind: 'voice', bytes: raw, encodeType: 7 });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('微信 Opus 封装失败');
+      expect(event.text).toContain('微信给出的转写');
+      const dir = await voicesDir(world);
+      const [file] = readdirSync(dir);
+      expect(file).toMatch(/\.wxopus$/);
+      expect(readFileSync(join(dir, file))).toEqual(raw);
+    } finally { await world.stop(); }
+  });
+
+  it.each([
+    [1, 'audio/pcm', '.pcm'], [2, 'audio/adpcm', '.adpcm'], [4, 'audio/speex', '.spx'],
+    [5, 'audio/amr', '.amr'], [8, 'audio/ogg', '.ogg'],
+  ] as const)('无可识别容器头的微信编码 %s 仍按声明的 %s 投递', async (encodeType, mime, extension) => {
+    const { world, blobs, bytes } = await receiveMedia({ mime, kind: 'voice', encodeType });
+    try {
+      expect(blobs).toHaveLength(1);
+      expect(blobs[0].mime).toBe(mime);
+      expect(blobs[0].name.endsWith(extension)).toBe(true);
+      expect(Buffer.from(blobs[0].bytes)).toEqual(bytes);
+    } finally { await world.stop(); }
+  });
+
+  it.each([3, 0, undefined])('未知或特征数据编码 %s 仅保留文件和转写', async (encodeType) => {
+    const { world, event, blobs } = await receiveMedia({ mime: 'application/octet-stream', kind: 'voice', encodeType });
+    try {
+      expect(blobs).toHaveLength(0);
+      expect(event.text).toContain('微信给出的转写');
+      expect(event.text).toContain('未取得可提交的标准音频');
+      expect(readdirSync(await voicesDir(world))).toEqual([expect.stringMatching(/\.bin$/)]);
     } finally { await world.stop(); }
   });
 

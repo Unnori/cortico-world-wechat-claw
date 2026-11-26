@@ -33,16 +33,23 @@ const EXT_TO_MIME: Record<string, string> = {
   '.mpga': 'audio/mpeg',
   '.aif': 'audio/aiff',
   '.aiff': 'audio/aiff',
+  '.aifc': 'audio/aiff',
   '.weba': 'audio/webm',
   '.ogg': 'audio/ogg',
+  '.oga': 'audio/ogg',
   '.wav': 'audio/wav',
   '.m4a': 'audio/mp4',
   '.flac': 'audio/flac',
   '.aac': 'audio/aac',
   '.opus': 'audio/opus',
   '.amr': 'audio/amr',
+  '.awb': 'audio/amr-wb',
   '.silk': 'audio/silk',
   '.pcm': 'audio/pcm',
+  '.l16': 'audio/l16',
+  '.alaw': 'audio/alaw',
+  '.mulaw': 'audio/mulaw',
+  '.adpcm': 'audio/adpcm',
   '.spx': 'audio/speex',
   '.pdf': 'application/pdf',
   '.doc': 'application/msword',
@@ -85,10 +92,12 @@ const MIME_TO_EXT: Record<string, string> = {
   'audio/aac': '.aac',
   'audio/opus': '.opus',
   'audio/amr': '.amr',
+  'audio/amr-wb': '.awb',
   'audio/silk': '.silk',
   'audio/pcm': '.pcm',
   'audio/adpcm': '.adpcm',
   'audio/speex': '.spx',
+  'audio/x-wechat-opus': '.wxopus',
   'application/pdf': '.pdf',
   'application/zip': '.zip',
   'text/plain': '.txt',
@@ -96,7 +105,23 @@ const MIME_TO_EXT: Record<string, string> = {
 };
 
 export const OCTET_STREAM = 'application/octet-stream';
+export const WECHAT_OPUS_MIME = 'audio/x-wechat-opus';
+export const WECHAT_OPUS_MAGIC = '#!OPUS_RAW_V1';
 const SILK_V3_HEADER = Buffer.from('#!SILK_V3');
+const AUDIO_MIME_ALIASES: Record<string, string[]> = {
+  'audio/mpeg': ['audio/mp3', 'audio/mpga'],
+  'audio/mp3': ['audio/mpeg', 'audio/mpga'],
+  'audio/mpga': ['audio/mpeg', 'audio/mp3'],
+  'audio/mp4': ['audio/m4a'],
+  'audio/m4a': ['audio/mp4'],
+  'audio/wav': ['audio/x-wav', 'audio/wave'],
+  'audio/opus': ['audio/ogg'],
+};
+
+/** Try equivalent names without treating distinct codecs as interchangeable. */
+export function audioMimeAliases(mime: string): readonly string[] {
+  return AUDIO_MIME_ALIASES[mime] ?? [];
+}
 
 /** SILK v3 头部长度。微信版在标准头前有一个 0x02。 */
 export function silkV3HeaderLength(bytes: Uint8Array): number {
@@ -110,9 +135,10 @@ export function mimeFromFilename(filename: string): string {
 }
 
 /** 入站文件先按可确认的容器头判类型，无法确认时保留文件名或微信编码给出的 MIME。 */
-export function mimeForInbound(bytes: Uint8Array, filename = '', fallback = OCTET_STREAM): string {
+export function mimeForInbound(bytes: Uint8Array, filename = '', fallback = OCTET_STREAM, kind?: 'voice'): string {
   const hint = mimeFromFilename(filename);
   const claimed = hint === OCTET_STREAM ? fallback : hint;
+  const audioContainer = kind === 'voice' || claimed.startsWith('audio/');
   const b = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const head = b.toString('latin1', 0, 16);
   const image = sniffImageMime(bytes);
@@ -123,16 +149,30 @@ export function mimeForInbound(bytes: Uint8Array, filename = '', fallback = OCTE
     if (head.slice(8, 12) === 'AVI ') return 'video/x-msvideo';
   }
   if (head.startsWith('fLaC')) return 'audio/flac';
-  if (head.startsWith('OggS')) return claimed.startsWith('video/') ? 'video/ogg' : 'audio/ogg';
+  if (head.startsWith('OggS')) {
+    const firstPacket = 27 + (b[26] ?? 0);
+    if ((b[26] ?? 0) > 0 && (b[27] ?? 0) >= 8 && b.toString('latin1', firstPacket, firstPacket + 8) === 'OpusHead') return 'audio/opus';
+    return claimed.startsWith('video/') ? 'video/ogg' : 'audio/ogg';
+  }
   if (head.startsWith('FORM') && ['AIFF', 'AIFC'].includes(head.slice(8, 12))) return 'audio/aiff';
   if (head.startsWith('#!AMR-WB')) return 'audio/amr-wb';
   if (head.startsWith('#!AMR')) return 'audio/amr';
+  if (head.startsWith(WECHAT_OPUS_MAGIC)) return WECHAT_OPUS_MIME;
   if (silkV3HeaderLength(bytes)) return 'audio/silk';
-  if (head.startsWith('ID3')) return 'audio/mpeg';
-  if (b.length >= 2 && b[0] === 0xff) {
-    if ((b[1]! & 0xf6) === 0xf0) return 'audio/aac';
-    if ((b[1]! & 0xe0) === 0xe0) return 'audio/mpeg';
+  const id3 = head.startsWith('ID3');
+  const tagSize = b.subarray(6, 10);
+  const audioStart = id3 && tagSize.length === 4 && tagSize.every(byte => byte < 128)
+    ? 10 + tagSize.reduce((size, byte) => size * 128 + byte, 0) + (b[3] === 4 && (b[5]! & 0x10) ? 10 : 0)
+    : 0;
+  const frame = b.subarray(audioStart, audioStart + 7);
+  if (frame.length >= 4 && frame[0] === 0xff) {
+    const flags = frame[1]!;
+    const rate = frame[2]!;
+    if (frame.length === 7 && (flags & 0xf6) === 0xf0 && ((rate >> 2) & 15) < 13) return 'audio/aac';
+    if ((flags & 0xe0) === 0xe0 && (flags & 0x18) !== 0x08 && (flags & 6) !== 0
+      && (rate & 0xf0) !== 0xf0 && (rate & 0x0c) !== 0x0c) return 'audio/mpeg';
   }
+  if (id3) return claimed === 'audio/aac' ? claimed : 'audio/mpeg';
   if (head.slice(4, 8) === 'ftyp') {
     const brand = head.slice(8, 12);
     if (['avif', 'avis'].includes(brand)) return 'image/avif';
@@ -142,11 +182,11 @@ export function mimeForInbound(bytes: Uint8Array, filename = '', fallback = OCTE
     if (brand.startsWith('3g2')) return 'video/3gpp2';
     if (brand.startsWith('3gp')) return 'video/3gpp';
     // MP4、M4A 共用容器；音轨类型由品牌或原文件类型区分。
-    return brand === 'M4A ' || claimed.startsWith('audio/') ? 'audio/mp4' : 'video/mp4';
+    return brand === 'M4A ' || audioContainer ? 'audio/mp4' : 'video/mp4';
   }
   if (head.startsWith('\x1aE\xdf\xa3')) {
     const prefix = b.toString('latin1', 0, Math.min(b.length, 4096));
-    if (prefix.includes('webm')) return claimed.startsWith('audio/') ? 'audio/webm' : 'video/webm';
+    if (prefix.includes('webm')) return audioContainer ? 'audio/webm' : 'video/webm';
     if (prefix.includes('matroska')) return 'video/x-matroska';
   }
   return claimed;

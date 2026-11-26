@@ -46,7 +46,7 @@ import { ILinkApi, ILinkError, MAX_TEXT_CHARS, DEFAULT_BASE_URL, DEFAULT_CDN_BAS
 import { MediaTransfer } from './protocol/media.ts';
 import { closeNetworkRoute, createNetworkRoute, type NetworkRoute } from './protocol/network.ts';
 import { fileMessage, imageMessage, progressMessage, textMessage, videoMessage, voiceMessage } from './protocol/outbound.ts';
-import { mimeForInbound, mimeFromFilename } from './protocol/mime.ts';
+import { audioMimeAliases, mimeForInbound, mimeFromFilename, OCTET_STREAM, WECHAT_OPUS_MIME } from './protocol/mime.ts';
 import { clockText, messageTimeMs, renderInbound, renderQuotedMedia, sanitizeRaw, shortId, type InboundMedia, type RenderOptions } from './protocol/inbound.ts';
 import { inboundItemShape, inboundMessageShape, inboundWireType } from './protocol/inbound-shape.ts';
 import { MessageItemType, MessageType, UploadMediaType, TypingStatus, type WeixinMessage } from './protocol/types.ts';
@@ -2115,6 +2115,14 @@ export class WechatClawWorld implements World {
           await this.#attachImage(blobs, item, limits, fitNotes);
           continue;
         }
+        if (item.mime === WECHAT_OPUS_MIME || (item.kind === 'voice' && item.mime === OCTET_STREAM)) {
+          fitNotes.push(`${item.label} 未附：未取得可提交的标准音频。`);
+          continue;
+        }
+        if (item.mime.startsWith('audio/')) {
+          await this.#addBlob(blobs, item.path, item.mime, item.label, fitNotes);
+          continue;
+        }
         const support = this.#mimeSupport(item.mime);
         if (support.error) {
           fitNotes.push(`${item.label} 未附：附件能力查询失败（${item.mime}，${support.error}）。`);
@@ -2199,21 +2207,23 @@ export class WechatClawWorld implements World {
 
   /** 读取失败或能力不支持时取消附件，并在事件正文告知原因。 */
   async #addBlob(blobs: AttachmentBlob[], path: string, mime: string, label: string, notes: string[]): Promise<void> {
-    const support = this.#mimeSupport(mime);
-    if (support.error) {
-      notes.push(`${label} 未附：附件能力查询失败（${mime}，${support.error}）。`);
+    for (const candidate of [mime, ...audioMimeAliases(mime)]) {
+      const support = this.#mimeSupport(candidate);
+      if (support.error) {
+        notes.push(`${label} 未附：附件能力查询失败（${candidate}，${support.error}）。`);
+        return;
+      }
+      if (!support.accepted) continue;
+      try {
+        const bytes = await readFile(path);
+        if (mime === 'audio/opus' && candidate === 'audio/ogg' && mimeForInbound(bytes) !== 'audio/opus') continue;
+        blobs.push({ bytes: new Uint8Array(bytes), mime: candidate, name: basename(path), fallbackText: label });
+      } catch (err) {
+        notes.push(`${label} 未附：附件读取失败（${errorText(err)}）。`);
+      }
       return;
     }
-    if (!support.accepted) {
-      notes.push(`${label} 未附：当前 Provider 不接受 ${mime} 输入。`);
-      return;
-    }
-    try {
-      const bytes = await readFile(path);
-      blobs.push({ bytes: new Uint8Array(bytes), mime, name: basename(path), fallbackText: label });
-    } catch (err) {
-      notes.push(`${label} 未附：附件读取失败（${errorText(err)}）。`);
-    }
+    notes.push(`${label} 未附：当前 Provider 不接受 ${mime} 输入。`);
   }
 
   /** 图片闸门的三个上限，从配置里取，带兜底值。 */

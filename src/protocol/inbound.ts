@@ -12,8 +12,9 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { datedFileName, uniqueFileName } from '../paths.ts';
-import { extensionForInbound, imageSize, mimeForInbound, silkV3HeaderLength, sniffImageMime } from './mime.ts';
+import { extensionForInbound, imageSize, mimeForInbound, OCTET_STREAM, sniffImageMime, WECHAT_OPUS_MIME } from './mime.ts';
 import { silkToWav } from '../media/voice.ts';
+import { wechatOpusToOgg } from '../media/wechat-opus.ts';
 import type { MediaTransfer } from './media.ts';
 import { MessageItemType, type MessageItem, type WeixinMessage } from './types.ts';
 import { inboundItemShape, inboundMessageShape, inboundWireType } from './inbound-shape.ts';
@@ -104,33 +105,17 @@ export function quoteSummary(item: MessageItem | undefined): string {
   return ref.svr_id ? `[引用消息 #${ref.svr_id}]` : '[引用消息]';
 }
 
-/** 语音编码类型 → 说明。 */
-function voiceEncodingName(encodeType: number | undefined): string {
-  switch (Number(encodeType)) {
-    case 1: return 'pcm';
-    case 2: return 'adpcm';
-    case 3: return 'feature';
-    case 4: return 'speex';
-    case 5: return 'amr';
-    case 6: return 'silk';
-    case 7: return 'mp3';
-    case 8: return 'ogg-speex';
-    default: return '未知编码';
-  }
-}
-
-function voiceMime(encodeType: number | undefined): string {
-  switch (Number(encodeType ?? 6)) {
-    case 1: return 'audio/pcm';
-    case 2: return 'audio/adpcm';
-    case 4: return 'audio/speex';
-    case 5: return 'audio/amr';
-    case 6: return 'audio/silk';
-    case 7: return 'audio/mpeg';
-    case 8: return 'audio/ogg';
-    default: return 'application/octet-stream';
-  }
-}
+/** iLink VoiceItem.encode_type. Feature data has no playable audio MIME. */
+const VOICE_ENCODINGS: Partial<Record<number, { name: string; mime: string }>> = {
+  1: { name: 'PCM', mime: 'audio/pcm' },
+  2: { name: 'ADPCM', mime: 'audio/adpcm' },
+  3: { name: 'feature', mime: OCTET_STREAM },
+  4: { name: 'Speex', mime: 'audio/speex' },
+  5: { name: 'AMR', mime: 'audio/amr' },
+  6: { name: 'SILK', mime: 'audio/silk' },
+  7: { name: 'MP3', mime: 'audio/mpeg' },
+  8: { name: 'Ogg Speex', mime: 'audio/ogg' },
+};
 
 export interface RenderOptions {
   media: MediaTransfer | null;
@@ -254,10 +239,11 @@ export async function renderInbound(
         lines.push(missText(fetched, `语音 ${secondsText}`, opts.maxBytes));
         continue;
       }
-      const enc = fetched.mime === voiceMime(voice?.encode_type) ? voiceEncodingName(voice?.encode_type) : fetched.mime;
+      const declared = VOICE_ENCODINGS[Number(voice?.encode_type)];
+      const enc = fetched.mime === OCTET_STREAM ? declared?.name ?? '未知'
+        : fetched.mime === declared?.mime ? declared.name : fetched.mime;
       const { voiceConversion, ...file } = fetched;
-      const format = voiceConversion === 'wav' ? '已转为 WAV'
-        : voiceConversion === 'failed' ? 'SILK 转码失败，保留原音频' : `${enc} 编码`;
+      const format = voiceConversion ?? `${enc} 编码`;
       lines.push(`[语音 ${secondsText}，${format}，已存为 ${file.path}]`);
       media.push({ ...file, kind: 'voice', label: `[语音 ${secondsText}]` });
       continue;
@@ -329,7 +315,7 @@ export async function renderInbound(
 
 /** 媒体取回的结果：成功给路径，失败给一句能区分原因的话。 */
 type FetchOutcome =
-  | { ok: true; path: string; mime: string; bytes: number; width?: number; height?: number; voiceConversion?: 'wav' | 'failed' }
+  | { ok: true; path: string; mime: string; bytes: number; width?: number; height?: number; voiceConversion?: string }
   | { ok: false; reason: 'too-large' | 'no-ref' | 'failed' };
 
 /** 取一个媒体项的字节并按类型落盘。 */
@@ -416,16 +402,26 @@ async function fetchItem(
       maxBytes: opts.maxBytes,
       cdnOnly: opts.cdnOnly,
     });
-    const mime = mimeForInbound(bytes, '', voiceMime(voice?.encode_type));
     const dir = join(opts.inboxDir, 'voices');
-    let voiceConversion: 'failed' | undefined;
-    if (silkV3HeaderLength(bytes)) {
+    let voiceConversion: string | undefined;
+    // Tencent's codec ID is only a hint. Conversion needs the matching header.
+    const actual = mimeForInbound(bytes, '', undefined, 'voice');
+    const mime = actual === OCTET_STREAM ? VOICE_ENCODINGS[Number(voice?.encode_type)]?.mime ?? OCTET_STREAM : actual;
+    if (actual === 'audio/silk') {
       try {
         const wav = await silkToWav(bytes, opts.maxBytes);
         const path = await saveMedia({ bytes: wav, dir, name: datedFileName(null, 'wx-voice', '.wav') });
-        return { ok: true, path, mime: 'audio/wav', bytes: wav.length, voiceConversion: 'wav' };
+        return { ok: true, path, mime: 'audio/wav', bytes: wav.length, voiceConversion: '已转为 WAV' };
       } catch {
-        voiceConversion = 'failed';
+        voiceConversion = 'SILK 转码失败，保留原音频';
+      }
+    } else if (actual === WECHAT_OPUS_MIME) {
+      try {
+        const opus = wechatOpusToOgg(bytes, opts.maxBytes);
+        const path = await saveMedia({ bytes: opus, dir, name: datedFileName(null, 'wx-voice', '.opus') });
+        return { ok: true, path, mime: 'audio/opus', bytes: opus.length, voiceConversion: '已封装为 Ogg Opus' };
+      } catch {
+        voiceConversion = '微信 Opus 封装失败，保留原音频';
       }
     }
     const path = await saveMedia({

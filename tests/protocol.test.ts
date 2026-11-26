@@ -311,6 +311,8 @@ describe('入站文件类型', () => {
     ['song.bin', 'fLaCfixture', 'audio/flac'],
     ['song.aif', 'FORM1234AIFF', 'audio/aiff'],
     ['song.bin', 'OggSfixture', 'audio/ogg'],
+    ['', 'OggS' + '\0'.repeat(22) + '\x01\x13OpusHead', 'audio/opus'],
+    ['voice.mp3', 'ID3\x04\x00\x00\x00\x00\x00\x00\xff\xf1\x50\x80\x00\xff\xfc', 'audio/aac'],
     ['video.ogv', 'OggSfixture', 'video/ogg'],
     ['voice.bin', '\x02#!SILK_V3', 'audio/silk'],
     ['voice.bin', '#!AMR\n', 'audio/amr'],
@@ -329,8 +331,17 @@ describe('入站文件类型', () => {
     expect(mimeForInbound(Buffer.from('data'), 'recording.aiff')).toBe('audio/aiff');
     expect(mimeForInbound(Buffer.from('data'), 'file.docx')).toBe('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     expect(mimeForInbound(Buffer.from('data'), '', 'audio/pcm')).toBe('audio/pcm');
+    expect(mimeForInbound(Buffer.from('fffffeff', 'hex'), '', 'audio/pcm')).toBe('audio/pcm');
     expect(mimeForInbound(Buffer.from('data'), 'file.unknown')).toBe('application/octet-stream');
     expect(mimeForInbound(Buffer.alloc(0))).toBe('application/octet-stream');
+  });
+
+  it('没有文件名或可用编码的语音条，可识别通用音频容器', () => {
+    expect(mimeForInbound(Buffer.from('\x00\x00\x00\x18ftypisom', 'latin1'), '', undefined, 'voice')).toBe('audio/mp4');
+    expect(mimeForInbound(Buffer.from('\x1aE\xdf\xa3\x42\x82webm', 'latin1'), '', undefined, 'voice')).toBe('audio/webm');
+    for (const ext of ['l16', 'alaw', 'mulaw']) {
+      expect(mimeForInbound(Buffer.alloc(4), `sample.${ext}`)).toBe(`audio/${ext}`);
+    }
   });
 });
 
